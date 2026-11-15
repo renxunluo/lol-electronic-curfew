@@ -506,10 +506,44 @@ def _hm_minutes(s):
     return int(h) * 60 + int(m)
 
 
+# ---------------- 法定工作日（2026 年，来源：国办发明电〔2025〕7 号）----------------
+# 放假日（不上班）
+HOLIDAYS = set()
+for _rng in ("2026-01-01:2026-01-03", "2026-02-15:2026-02-23",
+             "2026-04-04:2026-04-06", "2026-05-01:2026-05-05",
+             "2026-06-19:2026-06-21", "2026-09-25:2026-09-27",
+             "2026-10-01:2026-10-07"):
+    _a, _b = _rng.split(":")
+    _d = datetime.date.fromisoformat(_a)
+    _end = datetime.date.fromisoformat(_b)
+    while _d <= _end:
+        HOLIDAYS.add(_d.isoformat())
+        _d += datetime.timedelta(days=1)
+
+# 调休上班日（周末照常上班）
+MAKEUP_WORKDAYS = {
+    "2026-01-04", "2026-02-14", "2026-02-28",
+    "2026-05-09", "2026-09-20", "2026-10-10",
+}
+
+
+def is_workday(d=None):
+    """算不算工作日。2026 年按法定节假日+调休；没数据的年份退回周一到周五。"""
+    d = d or datetime.datetime.now()
+    if isinstance(d, datetime.datetime):
+        d = d.date()
+    s = d.isoformat()
+    if s in MAKEUP_WORKDAYS:
+        return True
+    if s in HOLIDAYS:
+        return False
+    return d.weekday() < 5
+
+
 def is_blocked_now():
     """现在是不是封锁时段。返回原因字符串，没封锁返回 None。"""
     now = datetime.datetime.now()
-    if WORKDAY_BLOCK and now.weekday() < 5:
+    if WORKDAY_BLOCK and is_workday(now):
         return "工作日"
     cur = now.hour * 60 + now.minute
     for s, e in BLOCK_RANGES:
