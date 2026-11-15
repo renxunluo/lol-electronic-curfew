@@ -58,6 +58,7 @@ PAGE = """<!DOCTYPE html>
   .panel { background: #1d1d2a; border-radius: 14px; padding: 16px 18px; margin-bottom: 14px; }
   .row { display: flex; align-items: center; justify-content: space-between; }
   .row + .row { margin-top: 13px; }
+  .hint { font-size: 11px; color: #5f5f78; margin-top: 5px; line-height: 1.6; }
   .label { font-size: 13px; color: #9d9db5; }
   .switch { position: relative; width: 44px; height: 24px; background: #33334a; border-radius: 12px;
             cursor: pointer; transition: .25s; flex: none; }
@@ -104,14 +105,20 @@ PAGE = """<!DOCTYPE html>
         <button class="step" onclick="setLimit(1)">+</button>
       </div>
     </div>
-    <div class="row">
+    <div class="hint">前几把随便玩，打满就不让开了。最多 5 把，想更严可以往下调。</div>
+
+    <div class="row" style="margin-top:18px">
       <span class="label">赢一把就睡觉</span>
       <div class="switch" id="switch" onclick="toggle()"></div>
     </div>
-    <div class="row">
+    <div class="hint">超过额度后：<b style="color:#9d9db5">赢了才收工</b>，输了放你继续打到赢为止。
+      开着它，输着睡不算数；关掉就是满额直接收工。</div>
+
+    <div class="row" style="margin-top:18px">
       <span class="label">最近一局</span>
       <span class="label" id="lastwin" style="color:#e8e8f0">-</span>
     </div>
+    <div class="hint">记着上一把的输赢，用来判断现在该收工、还是能再来一把。</div>
   </div>
 
   <div class="panel">
@@ -123,11 +130,15 @@ PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="panel" style="background:#191925">
-    <div class="label" style="color:#7c7c95">想换个额度？</div>
-    <div style="font-size:12px;color:#6b6b80;margin-top:7px;line-height:1.8">
-      改 <span style="color:#9d9db5">%LOCALAPPDATA%\\LolLimit\\config.json</span>，或者命令行：<br>
-      <span style="color:#8f8fa8">python lol_limit.py set limit 3</span><br>
-      <span style="color:#8f8fa8">python lol_limit.py set reset_hour 4</span>
+    <div class="label" style="color:#7c7c95">它是干嘛的</div>
+    <div style="font-size:12px;color:#6b6b80;margin-top:8px;line-height:1.8">
+      给那些打英雄联盟停不下来的人。<br>
+      前 5 把随便玩；打满之后<b style="color:#9d9db5">赢一把才准收工</b>，
+      输了可以接着打。局内绝不打断，不会让你秒退掉分。
+    </div>
+    <div style="font-size:11px;color:#55556b;margin-top:10px;line-height:1.7">
+      想设限时或工作日禁打：<br>
+      python lol_limit.py set block1 09:00-12:00
     </div>
   </div>
 
@@ -164,7 +175,8 @@ function render(d) {
   document.getElementById('slots').innerHTML = slots;
 
   const st = document.getElementById('state');
-  if (d.in_game) { st.textContent = '局内：正在打第 ' + d.count + ' 把，不会打断你'; st.className = 'state ok'; }
+  if (d.block) { st.textContent = '现在是「' + d.block + '」，不能打'; st.className = 'state stop'; }
+  else if (d.in_game) { st.textContent = '局内：正在打第 ' + d.count + ' 把，不会打断你'; st.className = 'state ok'; }
   else if (d.count < d.limit) { st.textContent = '还有额度，随便玩'; st.className = 'state ok'; }
   else if (d.last_win === false) { st.textContent = '上一把输了，放你继续（直到赢一把）'; st.className = 'state warn'; }
   else if (d.last_win === true) { st.textContent = '赢了，今天收工'; st.className = 'state stop'; }
@@ -191,9 +203,12 @@ function render(d) {
   document.getElementById('dot').className = 'dot ' + (d.guard ? 'on' : 'off');
   document.getElementById('guard').textContent =
       '守护进程：' + (d.guard ? '运行中 (pid ' + d.guard + ')' : '没在跑');
+  let extra = '';
+  if (cfg.workday_block) extra += ' · 工作日禁打';
+  if (cfg.block_ranges && cfg.block_ranges.length) extra += ' · 封锁 ' + cfg.block_ranges.join(' / ');
   document.getElementById('rule').textContent =
       '前 ' + d.limit + ' 把不拦 · ' + (cfg.win_to_sleep ? '赢一把就睡觉' : '满额即收工') +
-      ' · 换日 ' + String(cfg.reset_hour).padStart(2, '0') + ':00';
+      ' · 换日 ' + String(cfg.reset_hour).padStart(2, '0') + ':00' + extra;
 }
 async function toggle() {
   await fetch('/api/toggle', {method: 'POST'});
@@ -214,6 +229,7 @@ setInterval(load, 1000);
 
 def read_status():
     """只读状态，不写 state（避免和守护抢文件）。"""
+    L.reload_if_changed()          # 让封锁时段/开关这些全局量跟上配置文件
     st = L.load_state()
     today = L.day_key()
     if st.get("day") != today:
@@ -241,6 +257,7 @@ def read_status():
         "client_on": bool(clients),
         "last_win": st.get("last_win"),
         "guard": L._daemon_pid(),
+        "block": L.is_blocked_now(),
         "week": week,
         "config": cfg,
     }
@@ -297,7 +314,7 @@ def open_app_window(url):
             import subprocess
             prof = os.path.join(L.DATA_DIR, "ui_profile")
             subprocess.Popen([p, "--app=" + url,
-                              "--window-size=480,860",
+                              "--window-size=480,980",
                               "--window-position=100,80",
                               "--user-data-dir=" + prof,
                               "--no-first-run",
