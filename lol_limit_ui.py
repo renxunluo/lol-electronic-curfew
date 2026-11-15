@@ -113,9 +113,9 @@ PAGE = """<!DOCTYPE html>
     <div class="row">
       <span class="label">每日额度</span>
       <div class="stepper">
-        <button class="step" onclick="setLimit(-1)">−</button>
+        <button class="step" id="limit-down" onclick="setLimit(-1)">−</button>
         <span id="limitnum">5</span>
-        <button class="step" onclick="setLimit(1)">+</button>
+        <button class="step" id="limit-up" onclick="setLimit(1)">+</button>
       </div>
     </div>
     <div class="hint">前几把随便玩，打满就不让开了。最多 5 把，想更严可以往下调。</div>
@@ -214,6 +214,14 @@ function render(d) {
   document.getElementById('switch').className = 'switch' + (cfg.win_to_sleep ? ' on' : '');
   document.getElementById('limitnum').textContent = d.limit;
 
+  // 到硬上限就把 + 灰掉，不让人以为还能加
+  const cap = d.max_limit || 0;
+  const upBtn = document.getElementById('limit-up');
+  const atMax = cap && d.limit >= cap;
+  upBtn.style.opacity = atMax ? 0.3 : 1;
+  upBtn.style.pointerEvents = atMax ? 'none' : 'auto';
+  upBtn.title = atMax ? ('最多 ' + cap + ' 把') : '加一把';
+
   document.getElementById('sw-workday').className = 'switch' + (cfg.workday_block ? ' on' : '');
   const rs = cfg.block_ranges || [];
   const box = document.getElementById('blocks');
@@ -258,7 +266,10 @@ async function toggle() {
   load();
 }
 async function setLimit(delta) {
-  const n = Math.max(1, Math.min(20, (cfg.limit || 5) + delta));
+  const cap = cfg.max_limit || 20;
+  const cur = Math.min(cfg.limit || 5, cap);
+  const n = Math.max(1, Math.min(cap, cur + delta));
+  if (n === cur) return;                 // 已经到顶/到底，不再发请求
   await fetch('/api/set_limit?n=' + n, {method: 'POST'});
   load();
 }
@@ -319,10 +330,16 @@ def read_status():
                      "today": i == 0})
 
     cfg = L.read_config()
+    cap = int(cfg.get("max_limit") or 0)
+    lim = int(cfg.get("limit", 5))
+    if cap:
+        lim = min(lim, cap)           # 硬上限说了算
+    cfg["limit"] = lim
     return {
         "date": L.datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "count": count,
-        "limit": int(cfg.get("limit", 5)),
+        "limit": lim,
+        "max_limit": cap,
         "in_game": bool(games),
         "client_on": bool(clients),
         "last_win": st.get("last_win"),
@@ -364,8 +381,11 @@ class Handler(BaseHTTPRequestHandler):
                 n = int(q.get("n", ["5"])[0])
             except ValueError:
                 n = 5
-            n = max(1, min(20, n))
             cfg = L.read_config()
+            cap = int(cfg.get("max_limit") or 0)
+            n = max(1, min(20, n))
+            if cap:
+                n = min(n, cap)          # 不许超过硬上限
             cfg["limit"] = n
             L.write_config(cfg)
             self._send(200, json.dumps({"ok": True, "limit": n}, ensure_ascii=False))
