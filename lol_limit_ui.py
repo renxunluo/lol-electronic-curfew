@@ -65,6 +65,12 @@ PAGE = """<!DOCTYPE html>
   .switch::after { content: ""; position: absolute; width: 18px; height: 18px; background: #fff;
                    border-radius: 50%; top: 3px; left: 3px; transition: .25s; }
   .switch.on::after { left: 23px; }
+  .stepper { display: flex; align-items: center; gap: 10px; }
+  .step { width: 26px; height: 26px; border-radius: 8px; border: none; background: #2c2c3d;
+          color: #e8e8f0; font-size: 15px; line-height: 1; cursor: pointer; transition: .15s; }
+  .step:hover { background: #3a3a55; }
+  .step:active { transform: scale(.92); }
+  #limitnum { font-size: 15px; font-weight: 600; min-width: 22px; text-align: center; }
   .bars { display: flex; align-items: flex-end; gap: 6px; height: 62px; margin-top: 10px; }
   .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px; }
   .bar { width: 100%; background: #3a3a55; border-radius: 4px 4px 0 0; min-height: 2px; transition: .3s; }
@@ -90,6 +96,14 @@ PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="panel">
+    <div class="row">
+      <span class="label">每日额度</span>
+      <div class="stepper">
+        <button class="step" onclick="setLimit(-1)">−</button>
+        <span id="limitnum">5</span>
+        <button class="step" onclick="setLimit(1)">+</button>
+      </div>
+    </div>
     <div class="row">
       <span class="label">赢一把就睡觉</span>
       <div class="switch" id="switch" onclick="toggle()"></div>
@@ -157,6 +171,7 @@ function render(d) {
   else { st.textContent = '额度已满，开客户端会被关'; st.className = 'state stop'; }
 
   document.getElementById('switch').className = 'switch' + (cfg.win_to_sleep ? ' on' : '');
+  document.getElementById('limitnum').textContent = d.limit;
 
   const lw = document.getElementById('lastwin');
   lw.textContent = d.last_win === null ? '还不知道' : (d.last_win ? '赢了' : '输了');
@@ -182,6 +197,11 @@ function render(d) {
 }
 async function toggle() {
   await fetch('/api/toggle', {method: 'POST'});
+  load();
+}
+async function setLimit(delta) {
+  const n = Math.max(1, Math.min(20, (cfg.limit || 5) + delta));
+  await fetch('/api/set_limit?n=' + n, {method: 'POST'});
   load();
 }
 load();
@@ -212,16 +232,17 @@ def read_status():
                      "n": L.count_game_logs(d.date().isoformat()),
                      "today": i == 0})
 
+    cfg = L.read_config()
     return {
         "date": L.datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "count": count,
-        "limit": L.LIMIT,
+        "limit": int(cfg.get("limit", 5)),
         "in_game": bool(games),
         "client_on": bool(clients),
         "last_win": st.get("last_win"),
         "guard": L._daemon_pid(),
         "week": week,
-        "config": L.read_config(),
+        "config": cfg,
     }
 
 
@@ -249,6 +270,18 @@ class Handler(BaseHTTPRequestHandler):
             cfg["win_to_sleep"] = not cfg.get("win_to_sleep", True)
             L.write_config(cfg)
             self._send(200, json.dumps({"ok": True}))
+        elif self.path.startswith("/api/set_limit"):
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                n = int(q.get("n", ["5"])[0])
+            except ValueError:
+                n = 5
+            n = max(1, min(20, n))
+            cfg = L.read_config()
+            cfg["limit"] = n
+            L.write_config(cfg)
+            self._send(200, json.dumps({"ok": True, "limit": n}, ensure_ascii=False))
         else:
             self._send(404, "{}")
 
