@@ -131,7 +131,10 @@ python lol_limit.py uninstall
 ```json
 {
  "limit": 5,
+ "max_limit": 5,
  "win_to_sleep": true,
+ "workday_block": false,
+ "block_ranges": [],
  "grace_seconds": 10,
  "reset_hour": 0,
  "hard_cap": 0,
@@ -141,12 +144,19 @@ python lol_limit.py uninstall
 
 | 键 | 含义 |
 |---|---|
-| `limit` | 前几把不拦 |
+| `limit` | 前几把不拦（**发行版锁死最多 5 把**） |
+| `max_limit` | 额度硬上限，默认 5；设 0 才不限制 |
 | `win_to_sleep` | 「赢一把就睡觉」开关。`false` = 满额直接收工，不问输赢 |
+| `workday_block` | 工作日（周一到周五）全天禁打 |
+| `block_ranges` | 封锁时段，最多两个，如 `["09:00-12:00", "14:00-18:00"]` |
 | `grace_seconds` | 局末给几秒看结算再关 |
 | `reset_hour` | 几点换日（熬夜党建议设 4） |
-| `hard_cap` | 绝对上限，`0` = 不设限。设 10 就是再输也不许超 10 把 |
+| `hard_cap` | 绝对上限，`0` = 不设限 |
 | `lol_root` | 游戏安装目录，留空自动探测 |
+
+> **发行版锁死 5 把**：`max_limit` 默认 5，命令行 `set limit 8` 会被打回 5，
+> 界面点 + 到 5 就到头。想更严可以往下调（3 把、2 把），但上不去。
+> 这是故意的——工具要是能随便放宽，它就不叫宵禁了。
 
 命令行改也行：
 
@@ -154,7 +164,34 @@ python lol_limit.py uninstall
 python lol_limit.py set limit 3
 python lol_limit.py set win_to_sleep off
 python lol_limit.py set reset_hour 4
+python lol_limit.py set block1 09:00-12:00
+python lol_limit.py set block2 14:00-18:00
+python lol_limit.py set workday_block on
 ```
+
+---
+
+## 限时封锁 / 工作日禁打
+
+### 最多两个封锁时段
+
+```bash
+python lol_limit.py set block1 09:00-12:00
+python lol_limit.py set block2 14:00-18:00
+python lol_limit.py set block1 off
+```
+
+- 到点客户端开着就关（给 10 秒宽限看结算）
+- **正在对局中不打断**，让这局打完，之后不让你开新的
+- 支持跨午夜，比如 `23:00-02:00`
+
+### 工作日禁打
+
+```bash
+python lol_limit.py set workday_block on
+```
+
+周一到周五全天不许打。注意：**按周一到周五算，不认法定节假日和调休**。
 
 ---
 
