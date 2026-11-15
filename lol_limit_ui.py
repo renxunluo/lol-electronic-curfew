@@ -131,7 +131,8 @@ PAGE = """<!DOCTYPE html>
       <span class="label">最近一局</span>
       <span class="label" id="lastwin" style="color:#e8e8f0">-</span>
     </div>
-    <div class="hint">记着上一把的输赢，用来判断现在该收工、还是能再来一把。</div>
+    <div class="hint">记着上一把的输赢，用来判断现在该收工、还是能再来一把。
+      自动从 WeGame 战绩读，读不到才弹窗问你。</div>
   </div>
 
   <div class="panel">
