@@ -192,13 +192,13 @@ python lol_limit.py set block1 off
 python lol_limit.py set workday_block on
 ```
 
-**按法定工作日算**：内置了 2026 年国务院公布的节假日和调休安排——
-元旦、春节、清明、五一、端午、中秋、国庆都自动放行；
-调休上班的周末（比如 2 月 14 日、5 月 9 日、10 月 10 日）照样封。
+**按法定工作日算，而且会自动更新**：
 
-> 依据：[国办发明电〔2025〕7 号](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)。
-> 2027 年的安排发布后需要更新 `HOLIDAYS` / `MAKEUP_WORKDAYS` 两个表，
-> 没更新前会退回"周一到周五"的简单判断。
+- 内置了 2026 年国务院公布的节假日和调休安排（[国办发明电〔2025〕7 号](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)）作为离线兜底
+- 运行时会自动从 [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn)（社区维护的法定节假日数据）拉取当年 + 次年的安排，缓存在 `%LOCALAPPDATA%\LolLimit\holidays_<年>.json`
+- **不用每年手动改代码**：社区每年国务院发文后更新，你这边有网就自动跟上；没网就用缓存或内置表
+
+结果就是：元旦、春节、清明、五一、端午、中秋、国庆自动放行；调休上班的周末（比如 2026 年 2 月 14 日、10 月 10 日）照样封。
 
 ---
 
