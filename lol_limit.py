@@ -527,12 +527,93 @@ MAKEUP_WORKDAYS = {
 }
 
 
+# ---------------- 节假日数据：在线拉取 + 本地缓存 ----------------
+# 每年国务院公布安排后，开源仓库 NateScarlet/holiday-cn 会更新。
+# 优先用它（运行时自动下载并缓存），拉不到再用下面内置的 2026 表。
+HOLIDAY_URL = "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/%d.json"
+_YEAR_CACHE = {}
+_YEAR_TS = {}
+_FETCHING = set()
+
+
+def _holiday_file(year):
+    return os.path.join(DATA_DIR, "holidays_%d.json" % year)
+
+
+def _load_year_data(year):
+    try:
+        with open(_holiday_file(year), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        days = d.get("days") or []
+        off = {x["date"] for x in days if x.get("isOffDay")}
+        work = {x["date"] for x in days if not x.get("isOffDay")}
+        return off, work
+    except Exception:
+        return None
+
+
+def _fetch_year_data(year):
+    import urllib.request
+    try:
+        req = urllib.request.Request(HOLIDAY_URL % year,
+                                     headers={"User-Agent": "lol-limit/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = r.read().decode("utf-8")
+        d = json.loads(raw)
+        if not isinstance(d.get("days"), list) or not d["days"]:
+            return False
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(_holiday_file(year), "w", encoding="utf-8") as f:
+            f.write(raw)
+        return True
+    except Exception:
+        return False
+
+
+def _fetch_async(year):
+    if year in _FETCHING:
+        return
+    _FETCHING.add(year)
+
+    def _run():
+        try:
+            if _fetch_year_data(year):
+                _YEAR_CACHE[year] = _load_year_data(year)
+                _YEAR_TS[year] = time.time()
+                log("已获取 %d 年法定节假日数据" % year)
+        finally:
+            _FETCHING.discard(year)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _year_data(year):
+    """拿某年的 (放假集合, 调休上班集合)；没有返回 None，同时后台去拉。"""
+    now = time.time()
+    if year in _YEAR_CACHE and now - _YEAR_TS.get(year, 0) < 3600:
+        return _YEAR_CACHE[year]
+    data = _load_year_data(year)
+    _YEAR_CACHE[year] = data
+    _YEAR_TS[year] = now
+    if data is None:
+        _fetch_async(year)
+    return data
+
+
 def is_workday(d=None):
-    """算不算工作日。2026 年按法定节假日+调休；没数据的年份退回周一到周五。"""
+    """算不算工作日：优先在线/缓存的法定安排，其次内置 2026 表，最后周一到周五。"""
     d = d or datetime.datetime.now()
     if isinstance(d, datetime.datetime):
         d = d.date()
     s = d.isoformat()
+    data = _year_data(d.year)
+    if data:
+        off, work = data
+        if s in work:
+            return True
+        if s in off:
+            return False
+        return d.weekday() < 5
     if s in MAKEUP_WORKDAYS:
         return True
     if s in HOLIDAYS:
