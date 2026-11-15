@@ -27,6 +27,7 @@
 import ctypes
 import ctypes.wintypes as wt
 import datetime
+import hashlib
 import json
 import os
 import subprocess
@@ -728,12 +729,20 @@ def _find_wegame_window():
         return None
 
 
-def _classify_wegame_row(img, row=0):
-    """看第 row 行（0=最新）的结果颜色。返回 True赢 / False输 / None认不出。"""
+# 战绩列表有两种常见位置：常态在窗口右侧；点开某局详情时被挤到左侧。
+# 每个布局给 (结果列 x 起点, 终点, 首行 y, 行高)，都是相对窗口宽高的比例。
+_WG_LAYOUTS = (
+    (0.870, 0.950, 0.265, 0.093),   # 右侧（常态）
+    (0.320, 0.380, 0.318, 0.092),   # 左侧（点开详情后）
+)
+
+
+def _classify_at(img, layout, row=0):
     try:
+        x0r, x1r, y0r, hrate = layout
         W, H = img.size
-        x0, x1 = int(W * 0.870), int(W * 0.950)
-        y0 = int(H * 0.265) + row * int(H * 0.093)
+        x0, x1 = int(W * x0r), int(W * x1r)
+        y0 = int(H * y0r) + row * int(H * hrate)
         y1 = y0 + int(H * 0.080)
         crop = img.crop((x0, y0, x1, y1))
         px = list(crop.getdata())
@@ -752,8 +761,17 @@ def _classify_wegame_row(img, row=0):
         return None
 
 
-def read_wegame_latest_win():
-    """截 WeGame 窗口，读最新一局胜负。读不到返回 None。"""
+def _classify_wegame_row(img, row=0):
+    """看第 row 行（0=最新）的结果颜色。两种布局都试，认不出返回 None。"""
+    for layout in _WG_LAYOUTS:
+        res = _classify_at(img, layout, row)
+        if res is not None:
+            return res
+    return None
+
+
+def _capture_wegame():
+    """截 WeGame 窗口，返回 PIL Image 或 None。"""
     try:
         import uiautomation as auto
         from PIL import Image
@@ -766,29 +784,67 @@ def read_wegame_latest_win():
         p = os.path.join(DATA_DIR, "shots", "_wegame_probe.png")
         os.makedirs(os.path.dirname(p), exist_ok=True)
         auto.ControlFromHandle(hwnd).CaptureToImage(p)
-        return _classify_wegame_row(Image.open(p).convert("RGB"), 0)
+        return Image.open(p).convert("RGB")
     except Exception as e:
-        log("读 WeGame 截图失败: %r" % (e,))
+        log("截 WeGame 失败: %r" % (e,))
         return None
 
 
+def _row_fingerprint(img, row=0):
+    """第一行画面的指纹，用来确认 WeGame 是不是刷新出了新一局。"""
+    try:
+        W, H = img.size
+        x0, x1 = int(W * 0.770), int(W * 0.955)
+        y0 = int(H * 0.255) + row * int(H * 0.093)
+        y1 = y0 + int(H * 0.110)
+        return hashlib.md5(img.crop((x0, y0, x1, y1)).tobytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def read_wegame_latest_win():
+    """截 WeGame 窗口，读最新一局胜负。读不到返回 None。"""
+    img = _capture_wegame()
+    if img is None:
+        return None
+    return _classify_wegame_row(img, 0)
+
+
 def start_wegame_probe(delay=25):
-    """WeGame 战绩要等几秒才刷新，所以延迟去读，别卡住主循环。"""
+    """游戏结束后延迟去读。
+
+    WeGame 要等几秒才刷新战绩，所以先用「第一行指纹」确认它真的更新了：
+    对不上就继续等（最多再多等 60 秒），还是对不上就当读不到、退回弹窗。
+    """
     _WG["done"] = False
     _WG["win"] = None
+    baseline = _WG.get("baseline")
 
     def _run():
         try:
             time.sleep(delay)
-            w = read_wegame_latest_win()
-            _WG["win"] = w
-            if w is not None:
-                log("WeGame 战绩: 最近一局 %s" % ("赢了" if w else "输了"))
-            else:
-                log("WeGame 没读到战绩，准备弹窗问")
+            for attempt in range(7):          # 25 + 6×10 ≈ 85 秒
+                img = _capture_wegame()
+                if img is not None:
+                    fp = _row_fingerprint(img)
+                    fresh = (baseline is None) or (fp is not None and fp != baseline)
+                    if fresh:
+                        w = _classify_wegame_row(img, 0)
+                        if w is not None:
+                            _WG["win"] = w
+                            log("WeGame 战绩: 最近一局 %s%s"
+                                % ("赢了" if w else "输了",
+                                   "" if baseline is None else "（指纹已变化，确认是新一局）"))
+                            break
+                    else:
+                        log("WeGame 还没刷新（指纹未变），继续等")
+                if attempt < 6:
+                    time.sleep(10)
         except Exception as e:
             log("WeGame 探测异常: %r" % (e,))
         finally:
+            if _WG["win"] is None:
+                log("WeGame 没读到战绩，准备弹窗问")
             _WG["done"] = True
 
     threading.Thread(target=_run, daemon=True).start()
@@ -921,6 +977,9 @@ def tick(st):
     if in_game and not was:
         st["was_in_game"] = True
         save_state(st)
+        # 记下开打前 WeGame 战绩第一行的样子，局末用来确认它有没有刷新
+        _img = _capture_wegame()
+        _WG["baseline"] = _row_fingerprint(_img) if _img is not None else None
     elif (not in_game) and was:
         st["was_in_game"] = False
         st["awaiting"] = True
