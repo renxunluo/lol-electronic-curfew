@@ -9,6 +9,8 @@
     输了 -> 放行，接着打，直到赢一把为止
   自然日 0 点自动重置。
 
+还能设限时封锁（最多两个时段）和工作日禁打，见 README。
+
 计数依据（双保险，取大者）：
   1) Game\\Logs\\GameLogs\\ 下当天新建的时间戳目录（每进一局必建一个）
   2) 守护自己"看见"过的 League of Legends.exe 启动记录（state.json）
@@ -19,15 +21,8 @@
 
 快速开始：
   双击 install.bat   —— 装开机自启并启动守护
-  双击 status.bat    —— 看今天打了几把
+  双击 ui.bat        —— 打开界面
   双击 uninstall.bat —— 卸掉
-
-命令行：
-  python lol_limit.py install    装开机自启 + 启动
-  python lol_limit.py status     看进度（会顺手拉起守护）
-  python lol_limit.py config     看/改配置
-  python lol_limit.py set win_to_sleep off
-  python lol_limit.py uninstall  卸载
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -41,17 +36,21 @@ import time
 import traceback
 
 # ---------------------------------------------------------------- 可调参数
-# 这些是默认值；实际以 %LOCALAPPDATA%\LolLimit\config.json 为准。
+# 下面这些是默认值。改完想马上生效，用 `python lol_limit.py set key value`，
+# 或者直接改 %LOCALAPPDATA%\LolLimit\config.json（守护会自动重载）。
 LIMIT = 5                      # 前几把不拦
+MAX_LIMIT = 5                  # 额度硬上限（0 = 不限）；自用版锁死 5，调不上去
+BLOCK_RANGES = []              # 封锁时段 [(s,e), ...]，最多两个
+WORKDAY_BLOCK = False          # 工作日（周一到周五）全天不许打
 WIN_TO_SLEEP = True            # 选项「赢一把就睡觉」：满额后赢一把才关，输了可继续
-HARD_CAP = 0                   # 绝对上限（0 = 不设限）
+HARD_CAP = 0                   # 绝对上限（0 = 不设限）。设 10 就是再输也不许超 10 把
 RESET_HOUR = 0                 # 几点换日（0 = 自然日 0 点）
 GRACE_SECONDS = 10             # 局末留几秒看结算，再关客户端
 POLL_PROC = 1.0                # 主循环间隔（秒）
 ASK_WAIT = 90                  # 弹窗最多等多久，超时按"赢了"处理
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
-LOL_ROOT = ""                  # 运行时由 find_lol_root() 填
+LOL_ROOT = r"D:\WeGameApps\英雄联盟"   # 运行时会被自动探测覆盖
 
 
 def _is_lol_root(p):
@@ -85,10 +84,7 @@ def _root_from_procs():
 
 
 def find_lol_root():
-    """找游戏安装目录：配置 > 运行中进程 > 注册表 > 常见路径。
-
-    返回 "" 表示没找到，需要用户自己在 config.json 里填 lol_root。
-    """
+    """找游戏安装目录：配置 > 运行中进程 > 注册表 > 常见路径。"""
     p = read_config().get("lol_root") or ""
     if _is_lol_root(p):
         return p
@@ -389,6 +385,7 @@ def fresh_state(prev=None):
         "awaiting": False,                # 刚打完，正在等本人确认
         "await_deadline": 0.0,
         "was_in_game": False,
+        "block_until": 0.0,               # 时间封锁时的宽限计时
     }
 
 
@@ -421,11 +418,14 @@ def save_state(st):
 # ---------------------------------------------------------------- 配置
 _DEFAULTS = {
     "limit": 5,
+    "max_limit": 5,          # 额度硬上限：自用版锁死 5，怎么调都上不去
     "win_to_sleep": True,
     "grace_seconds": 10,
     "reset_hour": 0,
     "hard_cap": 0,
     "lol_root": "",          # 留空 = 自动探测
+    "block_ranges": [],      # 最多两个「HH:MM-HH:MM」，这些时段不许打
+    "workday_block": False,  # 工作日（周一到周五）全天不许打
 }
 _CFG_MTIME = {"v": -1.0}
 
@@ -457,18 +457,70 @@ def write_config(cfg):
 def apply_config(cfg):
     """把配置套到全局变量上；返回是否真的有变化。"""
     global LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT
-    old = (LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT)
+    global MAX_LIMIT, BLOCK_RANGES, WORKDAY_BLOCK
+    old = (LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT,
+           MAX_LIMIT, tuple(BLOCK_RANGES), WORKDAY_BLOCK)
+
     LIMIT = max(1, int(cfg.get("limit", 5)))
+    MAX_LIMIT = max(0, int(cfg.get("max_limit", 0)))
+    if MAX_LIMIT:
+        LIMIT = min(LIMIT, MAX_LIMIT)     # 额度不许超过硬上限
     WIN_TO_SLEEP = bool(cfg.get("win_to_sleep", True))
     GRACE_SECONDS = max(0, int(cfg.get("grace_seconds", 10)))
     RESET_HOUR = int(cfg.get("reset_hour", 0)) % 24
     HARD_CAP = max(0, int(cfg.get("hard_cap", 0)))
+    BLOCK_RANGES = _parse_ranges(cfg.get("block_ranges"))
+    WORKDAY_BLOCK = bool(cfg.get("workday_block", False))
+
     root = cfg.get("lol_root") or ""
-    if root and os.path.isdir(root):
+    if _is_lol_root(root):
         LOL_ROOT = root
-    elif not LOL_ROOT:
-        LOL_ROOT = find_lol_root()
-    return old != (LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT)
+    elif not _is_lol_root(LOL_ROOT):
+        LOL_ROOT = find_lol_root() or LOL_ROOT
+
+    return old != (LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT,
+                   MAX_LIMIT, tuple(BLOCK_RANGES), WORKDAY_BLOCK)
+
+
+def _parse_ranges(raw):
+    """把 ["09:00-12:00", ...] 解析成 [(s,e), ...]，最多两个。"""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if len(out) >= 2:
+            break
+        try:
+            s, e = str(item).replace("：", ":").split("-")
+            s, e = s.strip(), e.strip()
+            datetime.datetime.strptime(s, "%H:%M")
+            datetime.datetime.strptime(e, "%H:%M")
+            out.append((s, e))
+        except Exception:
+            continue
+    return out
+
+
+def _hm_minutes(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def is_blocked_now():
+    """现在是不是封锁时段。返回原因字符串，没封锁返回 None。"""
+    now = datetime.datetime.now()
+    if WORKDAY_BLOCK and now.weekday() < 5:
+        return "工作日"
+    cur = now.hour * 60 + now.minute
+    for s, e in BLOCK_RANGES:
+        a, b = _hm_minutes(s), _hm_minutes(e)
+        if a <= b:                       # 同一天内
+            if a <= cur < b:
+                return "限时 %s-%s" % (s, e)
+        else:                            # 跨午夜，比如 23:00-02:00
+            if cur >= a or cur < b:
+                return "限时 %s-%s" % (s, e)
+    return None
 
 
 def ensure_config():
@@ -652,6 +704,31 @@ def tick(st):
         # 局内一律不打断：硬断算秒退，掉分还吃排队惩罚
         return
 
+    # ---------------- 时间封锁（限时 / 工作日）----------------
+    block = is_blocked_now()
+    if block:
+        if st.get("grace_until"):
+            st["grace_until"] = 0.0
+            save_state(st)
+        if not clients:
+            return
+        if not st.get("block_until"):
+            st["block_until"] = now + GRACE_SECONDS
+            save_state(st)
+            return
+        if now >= st["block_until"]:
+            if now - (st.get("last_kill") or 0) < 20:
+                return
+            if shutdown_clients(clients, block):
+                st["last_kill"] = now
+                save_state(st)
+                log("时间封锁: %s" % block)
+                popup("现在是%s，不许打。\n\n英雄联盟已关闭，过了这段时间再说。" % block)
+        return
+    elif st.get("block_until"):
+        st["block_until"] = 0.0
+        save_state(st)
+
     if count < LIMIT:                     # 前 N 把不拦
         if st.get("grace_until"):
             st["grace_until"] = 0.0
@@ -676,7 +753,7 @@ def tick(st):
                     save_state(st)
                     log("超时没确认，按赢了处理")
             if st.get("last_win") is False:
-                # 输了 -> 放行，让它再打一把，直到赢为止
+                # 输了 -> 放行，让他再打一把（这正是想要的）
                 if st.get("grace_until"):
                     st["grace_until"] = 0.0
                     save_state(st)
@@ -771,12 +848,13 @@ def cmd_status():
         print("  当前状态        客户端开着，还没进对局")
     else:
         print("  当前状态        客户端没开")
+    blocked = is_blocked_now()
+    if blocked:
+        print("  时间状态        ★ 现在%s，不能打" % blocked)
     print("-" * 50)
     print("  计数来源        对局日志 %d 个 / 守护记录 %d 个（取大）" % (hard, seen_n))
     if _is_lol_root(LOL_ROOT):
         print("  游戏目录        %s" % LOL_ROOT)
-    else:
-        print("  游戏目录        没找到！把 lol_root 填进 config.json（或先开一次客户端）")
     if st.get("giveups"):
         print("  求过解锁        %d 次，一次也没给" % st["giveups"])
     print("-" * 50)
@@ -867,35 +945,79 @@ def cmd_restart():
 
 def cmd_config():
     cfg = read_config()
+    ranges = cfg.get("block_ranges") or []
     print("=" * 54)
     print("  当前配置   %s" % CONFIG_FILE)
     print("=" * 54)
     print("  limit         前几把不拦          %d 把" % cfg["limit"])
+    print("  max_limit     额度硬上限          %s" % (cfg["max_limit"] or "不限制"))
     print("  win_to_sleep  「赢一把就睡觉」    %s" % ("开（赢了收工，输了可继续）"
                                                     if cfg["win_to_sleep"] else "关（满额直接收工）"))
+    print("  workday_block 工作日全天不许打    %s" % ("开" if cfg["workday_block"] else "关"))
+    print("  block_ranges  封锁时段            %s" % (" / ".join(ranges) if ranges else "（无）"))
     print("  grace_seconds 局末宽限            %d 秒" % cfg["grace_seconds"])
     print("  reset_hour    几点换日            %02d:00" % (cfg["reset_hour"] % 24))
     print("  hard_cap      绝对上限            %s" % (cfg["hard_cap"] or "不设限"))
     print("=" * 54)
+    blocked = is_blocked_now()
+    print("  现在状态      %s" % ("★ %s，不能打" % blocked if blocked else "没在封锁时段"))
+    print("=" * 54)
     print("  改法：")
-    print("    python lol_limit.py set win_to_sleep off")
+    print("    python lol_limit.py set block1 09:00-12:00")
+    print("    python lol_limit.py set block2 14:00-18:00")
+    print("    python lol_limit.py set workday_block on")
     print("    python lol_limit.py set limit 3")
-    print("    python lol_limit.py set grace_seconds 10")
     print("  （守护每秒检查配置文件，改完立即生效，不用重启）")
 
 
 def cmd_set(args):
     if len(args) < 2:
         print("用法：set <键> <值>")
-        print("  键：limit / win_to_sleep / grace_seconds / reset_hour / hard_cap")
-        print("  例：set win_to_sleep off")
+        print("  limit           前几把不拦（受 max_limit 卡住）")
+        print("  max_limit       额度硬上限（0 = 不限）")
+        print("  win_to_sleep    on / off   「赢一把就睡觉」")
+        print("  workday_block   on / off   工作日全天不许打")
+        print("  block1          09:00-12:00 或 off   第一个封锁时段")
+        print("  block2          14:00-18:00 或 off   第二个封锁时段")
+        print("  grace_seconds / reset_hour / hard_cap")
         return
+
     key, raw = args[0].lower(), args[1].lower()
+    cfg = read_config()
+
+    # 封锁时段单独处理
+    if key in ("block1", "block2"):
+        idx = 0 if key == "block1" else 1
+        ranges = list(cfg.get("block_ranges") or [])
+        while len(ranges) <= idx:
+            ranges.append("")
+        if raw in ("off", "none", "关", "清空"):
+            ranges[idx] = ""
+        else:
+            try:
+                s, e = raw.replace("：", ":").split("-")
+                datetime.datetime.strptime(s.strip(), "%H:%M")
+                datetime.datetime.strptime(e.strip(), "%H:%M")
+                ranges[idx] = "%s-%s" % (s.strip(), e.strip())
+            except Exception:
+                print("时间格式不对，要写成 09:00-12:00 这样")
+                return
+        cfg["block_ranges"] = [r for r in ranges if r]
+        write_config(cfg)
+        apply_config(cfg)
+        reload_if_changed()
+        print("封锁时段现在是：%s" % (cfg["block_ranges"] or "（无）"))
+        return
+
+    if key == "block_ranges":
+        print("请用 set block1 / set block2 来设时段")
+        return
+
     if key not in _DEFAULTS:
         print("不认识的键：%s（可选：%s）" % (key, " / ".join(_DEFAULTS)))
         return
-    cfg = read_config()
-    if key == "win_to_sleep":
+
+    if key in ("win_to_sleep", "workday_block"):
         cfg[key] = raw in ("on", "true", "1", "yes", "开", "是")
     else:
         try:
@@ -903,13 +1025,21 @@ def cmd_set(args):
         except ValueError:
             print("「%s」要填数字" % key)
             return
+
+    if key == "limit" and cfg.get("max_limit"):
+        cap = int(cfg["max_limit"])
+        if cfg["limit"] > cap:
+            print("额度上限锁死在 %d 把，不能设成 %d" % (cap, cfg["limit"]))
+            cfg["limit"] = cap
+
     write_config(cfg)
     apply_config(cfg)
     reload_if_changed()
-    shown = ("开" if cfg[key] else "关") if key == "win_to_sleep" else cfg[key]
+    if key in ("win_to_sleep", "workday_block"):
+        shown = "开" if cfg[key] else "关"
+    else:
+        shown = cfg[key]
     print("已更新：%s = %s" % (key, shown))
-    if key == "win_to_sleep":
-        print("「赢一把就睡觉」现在是%s状态。" % ("开" if cfg[key] else "关"))
 
 
 def cmd_giveup():
