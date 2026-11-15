@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+config.json
+state.json
+guard.log
+.venv/
