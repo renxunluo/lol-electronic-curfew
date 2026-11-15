@@ -59,6 +59,19 @@ PAGE = """<!DOCTYPE html>
   .row { display: flex; align-items: center; justify-content: space-between; }
   .row + .row { margin-top: 13px; }
   .hint { font-size: 11px; color: #5f5f78; margin-top: 5px; line-height: 1.6; }
+  .blockrow { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .blockrow input[type=time] {
+    background: #23233a; color: #e8e8f0; border: none; border-radius: 8px;
+    padding: 6px 8px; font-size: 13px; font-family: inherit; width: 96px;
+    color-scheme: dark;
+  }
+  .blockrow .sep { color: #5f5f78; font-size: 12px; }
+  .blockrow .del {
+    width: 24px; height: 24px; border-radius: 7px; border: none;
+    background: #2c2c3d; color: #8a8aa0; cursor: pointer; line-height: 1;
+    margin-left: auto; font-size: 14px;
+  }
+  .blockrow .del:hover { background: #4a2c33; color: #ff7b8a; }
   .label { font-size: 13px; color: #9d9db5; }
   .switch { position: relative; width: 44px; height: 24px; background: #33334a; border-radius: 12px;
             cursor: pointer; transition: .25s; flex: none; }
@@ -119,6 +132,22 @@ PAGE = """<!DOCTYPE html>
       <span class="label" id="lastwin" style="color:#e8e8f0">-</span>
     </div>
     <div class="hint">记着上一把的输赢，用来判断现在该收工、还是能再来一把。</div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <span class="label">工作日禁打</span>
+      <div class="switch" id="sw-workday" onclick="toggleKey('workday_block')"></div>
+    </div>
+    <div class="hint">周一到周五全天不许打。已按 2026 年法定节假日和调休校准——节假日不封，
+      调休上班的那几天照封。</div>
+
+    <div class="row" style="margin-top:20px">
+      <span class="label">限时封锁</span>
+      <button class="step" id="addblock" onclick="addBlock()" title="添加一个时段">+</button>
+    </div>
+    <div class="hint">这些时段不许打，最多两个，跨午夜也行（比如 23:00-02:00）。</div>
+    <div id="blocks"></div>
   </div>
 
   <div class="panel">
@@ -185,6 +214,20 @@ function render(d) {
   document.getElementById('switch').className = 'switch' + (cfg.win_to_sleep ? ' on' : '');
   document.getElementById('limitnum').textContent = d.limit;
 
+  document.getElementById('sw-workday').className = 'switch' + (cfg.workday_block ? ' on' : '');
+  const rs = cfg.block_ranges || [];
+  const box = document.getElementById('blocks');
+  box.innerHTML = rs.map(function (r, i) {
+    const p = r.split('-');
+    return '<div class="blockrow">' +
+      '<input type="time" value="' + p[0] + '" onchange="setBlock(' + i + ',0,this.value)">' +
+      '<span class="sep">到</span>' +
+      '<input type="time" value="' + p[1] + '" onchange="setBlock(' + i + ',1,this.value)">' +
+      '<button class="del" onclick="delBlock(' + i + ')">×</button>' +
+      '</div>';
+  }).join('');
+  document.getElementById('addblock').style.display = rs.length >= 2 ? 'none' : '';
+
   const lw = document.getElementById('lastwin');
   lw.textContent = d.last_win === null ? '还不知道' : (d.last_win ? '赢了' : '输了');
   lw.style.color = d.last_win === null ? '#7c7c95' : (d.last_win ? '#6ee7a8' : '#ffb86b');
@@ -218,6 +261,33 @@ async function setLimit(delta) {
   const n = Math.max(1, Math.min(20, (cfg.limit || 5) + delta));
   await fetch('/api/set_limit?n=' + n, {method: 'POST'});
   load();
+}
+async function postConfig(patch) {
+  await fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(patch)
+  });
+  load();
+}
+function toggleKey(k) { postConfig({[k]: !cfg[k]}); }
+function addBlock() {
+  const rs = (cfg.block_ranges || []).slice();
+  if (rs.length >= 2) return;
+  rs.push('09:00-12:00');
+  postConfig({block_ranges: rs});
+}
+function delBlock(i) {
+  const rs = (cfg.block_ranges || []).slice();
+  rs.splice(i, 1);
+  postConfig({block_ranges: rs});
+}
+function setBlock(i, idx, val) {
+  const rs = (cfg.block_ranges || []).slice();
+  const cur = (rs[i] || '09:00-12:00').split('-');
+  cur[idx] = val;
+  rs[i] = cur[0] + '-' + cur[1];
+  postConfig({block_ranges: rs});
 }
 load();
 setInterval(load, 1000);
@@ -299,6 +369,34 @@ class Handler(BaseHTTPRequestHandler):
             cfg["limit"] = n
             L.write_config(cfg)
             self._send(200, json.dumps({"ok": True, "limit": n}, ensure_ascii=False))
+        elif self.path.startswith("/api/config"):
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            try:
+                payload = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            cfg = L.read_config()
+            for k in ("win_to_sleep", "workday_block"):
+                if k in payload:
+                    cfg[k] = bool(payload[k])
+            if "block_ranges" in payload and isinstance(payload["block_ranges"], list):
+                cleaned = []
+                for item in payload["block_ranges"][:2]:
+                    try:
+                        s, e = str(item).replace("：", ":").split("-")
+                        L.datetime.datetime.strptime(s.strip(), "%H:%M")
+                        L.datetime.datetime.strptime(e.strip(), "%H:%M")
+                        cleaned.append("%s-%s" % (s.strip(), e.strip()))
+                    except Exception:
+                        pass
+                cfg["block_ranges"] = cleaned
+            L.write_config(cfg)
+            self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
         else:
             self._send(404, "{}")
 
