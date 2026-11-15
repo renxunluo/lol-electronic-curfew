@@ -54,36 +54,114 @@ LOG_MAX_BYTES = 2 * 1024 * 1024
 LOL_ROOT = ""                  # 运行时由 find_lol_root() 填
 
 
+def _is_lol_root(p):
+    """确认这个目录真是游戏根目录：里面有 Game\\Logs\\GameLogs。"""
+    return bool(p) and os.path.isdir(os.path.join(p, r"Game\Logs\GameLogs"))
+
+
+def _root_from_exe(exe):
+    """从进程 exe 路径往上找，直到找到含 Game\\Logs\\GameLogs 的目录。"""
+    if not exe:
+        return None
+    d = os.path.dirname(exe)
+    for _ in range(6):
+        if _is_lol_root(d):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _root_from_procs():
+    """从正在运行的客户端/游戏进程反推安装目录（最准，任何盘符都行）。"""
+    for p in list_procs():
+        if p.name == GAME_PROC_NAME or p.name in CLIENT_PROC_NAMES:
+            root = _root_from_exe(p.path)
+            if root:
+                return root
+    return None
+
+
 def find_lol_root():
-    """找英雄联盟安装目录：配置 > 注册表 > 常见路径。"""
+    """找游戏安装目录：配置 > 运行中进程 > 注册表 > 常见路径。
+
+    返回 "" 表示没找到，需要用户自己在 config.json 里填 lol_root。
+    """
     p = read_config().get("lol_root") or ""
-    if p and os.path.isdir(p):
+    if _is_lol_root(p):
         return p
+
+    root = _root_from_procs()
+    if root:
+        return root
+
     try:
         import winreg
-        for key in (r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\英雄联盟",
-                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\英雄联盟",
-                    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\League of Legends",
-                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\League of Legends"):
+        keys = (
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\英雄联盟",
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\英雄联盟",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\League of Legends",
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\League of Legends",
+            r"SOFTWARE\WOW6432Node\Riot Games, Inc\League of Legends",
+            r"SOFTWARE\Riot Games, Inc\League of Legends",
+        )
+        for key in keys:
             try:
                 with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
-                    v, _ = winreg.QueryValueEx(k, "InstallSource")
-                    if v and os.path.isdir(v):
-                        return v
+                    for val in ("InstallSource", "InstallLocation", "DisplayIcon", "Path"):
+                        try:
+                            v, _ = winreg.QueryValueEx(k, val)
+                        except OSError:
+                            continue
+                        if not v:
+                            continue
+                        cand = v if os.path.isdir(v) else os.path.dirname(v)
+                        if _is_lol_root(cand):
+                            return cand
             except OSError:
                 continue
     except Exception:
         pass
-    for p in (r"D:\WeGameApps\英雄联盟", r"C:\WeGameApps\英雄联盟",
-              r"D:\Riot Games\League of Legends", r"C:\Riot Games\League of Legends",
-              r"E:\WeGameApps\英雄联盟"):
-        if os.path.isdir(p):
-            return p
-    return r"D:\WeGameApps\英雄联盟"
+
+    for drive in "CDEFGH":
+        base = drive + ":\\"
+        if not os.path.isdir(base):
+            continue
+        for rel in (r"WeGameApps\英雄联盟", r"Riot Games\League of Legends",
+                    r"Program Files\WeGameApps\英雄联盟",
+                    r"Program Files (x86)\WeGameApps\英雄联盟",
+                    r"Games\英雄联盟", r"英雄联盟", "LOL",
+                    r"Program Files\Riot Games\League of Legends",
+                    r"Program Files (x86)\Riot Games\League of Legends"):
+            cand = os.path.join(base, rel)
+            if _is_lol_root(cand):
+                return cand
+    return ""
+
+
+def learn_root_from_procs():
+    """守护运行中顺手学路径：只要客户端启动过一次，就能自己认出来。"""
+    global LOL_ROOT
+    if _is_lol_root(LOL_ROOT):
+        return False
+    root = _root_from_procs()
+    if not root:
+        return False
+    LOL_ROOT = root
+    try:
+        cfg = read_config()
+        cfg["lol_root"] = root
+        write_config(cfg)
+    except Exception:
+        pass
+    log("自动识别到游戏目录: %s" % root)
+    return True
 
 
 def game_log_dir():
-    return os.path.join(LOL_ROOT, r"Game\Logs\GameLogs")
+    return os.path.join(LOL_ROOT, r"Game\Logs\GameLogs") if LOL_ROOT else ""
 
 # 满额后要关掉的客户端进程（只认 LOL 目录下的，不碰 WeGame 本体）
 CLIENT_PROC_NAMES = {
@@ -542,6 +620,8 @@ def run_daemon():
 def tick(st):
     """单次判断 + 执行拦截。st 可变字典，跨天时原地重置。"""
     reload_if_changed()                   # 配置改了这里自动生效
+    if not _is_lol_root(LOL_ROOT):        # 还没认出装在哪，趁客户端开着学一下
+        learn_root_from_procs()
     if st.get("day") != day_key():        # 跨天清零
         n = fresh_state(st)
         st.clear()
@@ -693,7 +773,10 @@ def cmd_status():
         print("  当前状态        客户端没开")
     print("-" * 50)
     print("  计数来源        对局日志 %d 个 / 守护记录 %d 个（取大）" % (hard, seen_n))
-    print("  游戏目录        %s" % (LOL_ROOT or "（没找到）"))
+    if _is_lol_root(LOL_ROOT):
+        print("  游戏目录        %s" % LOL_ROOT)
+    else:
+        print("  游戏目录        没找到！把 lol_root 填进 config.json（或先开一次客户端）")
     if st.get("giveups"):
         print("  求过解锁        %d 次，一次也没给" % st["giveups"])
     print("-" * 50)
