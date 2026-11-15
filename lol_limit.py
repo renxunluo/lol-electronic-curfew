@@ -679,6 +679,121 @@ def popup(text, title="英雄联盟 · 每日限额"):
 # --------------------------------------------- 战后确认：赢了吗？
 # 国服客户端把本地接口锁死了（lockfile 恒为 0 字节、命令行读不到），
 # 读不到自动胜负，只能在打满额度后问一句。
+def snapshot_on_game_end():
+    """每局结束抓一张屏，存到 +shots（诊断用，也方便以后做识别）。"""
+    try:
+        from PIL import ImageGrab
+        d = os.path.join(DATA_DIR, "shots")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".png")
+        try:
+            img = ImageGrab.grab(all_screens=True)   # 双屏也要截全
+        except TypeError:
+            img = ImageGrab.grab()
+        img.save(p)
+        log("对局结束截图: %s (%dx%d)" % (p, img.size[0], img.size[1]))
+        files = sorted(os.listdir(d))
+        for old in files[:-20]:
+            try:
+                os.remove(os.path.join(d, old))
+            except OSError:
+                pass
+    except Exception as e:
+        log("截图失败: %r" % (e,))
+
+
+# --------------------------------------------- 从 WeGame 战绩列表自动读胜负
+# WeGame 主界面右侧「历史战绩」每行都写着 胜利(青绿) / 失败(红)。
+# 截窗口 → 取第一行结果列的颜色 → 判胜负。读不到再退回弹窗问人。
+_WG = {"done": False, "win": None}
+
+
+def _find_wegame_window():
+    try:
+        hwnds = []
+        user32 = ctypes.windll.user32
+
+        def _cb(h, l):
+            if user32.IsWindowVisible(h):
+                b = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(h, b, 256)
+                if b.value.lower() == "ceftopwindow":
+                    hwnds.append(h)
+            return True
+
+        CB = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        user32.EnumWindows(CB(_cb), 0)
+        return hwnds[0] if hwnds else None
+    except Exception:
+        return None
+
+
+def _classify_wegame_row(img, row=0):
+    """看第 row 行（0=最新）的结果颜色。返回 True赢 / False输 / None认不出。"""
+    try:
+        W, H = img.size
+        x0, x1 = int(W * 0.870), int(W * 0.950)
+        y0 = int(H * 0.265) + row * int(H * 0.093)
+        y1 = y0 + int(H * 0.080)
+        crop = img.crop((x0, y0, x1, y1))
+        px = list(crop.getdata())
+        bright = [c for c in px if c[0] + c[1] + c[2] > 200]
+        if len(bright) < 40:
+            return None
+        r = sum(c[0] for c in bright) // len(bright)
+        g = sum(c[1] for c in bright) // len(bright)
+        b = sum(c[2] for c in bright) // len(bright)
+        if g > r + 40 and g > b:
+            return True
+        if r > g + 40 and r > b:
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def read_wegame_latest_win():
+    """截 WeGame 窗口，读最新一局胜负。读不到返回 None。"""
+    try:
+        import uiautomation as auto
+        from PIL import Image
+    except Exception:
+        return None
+    hwnd = _find_wegame_window()
+    if not hwnd:
+        return None
+    try:
+        p = os.path.join(DATA_DIR, "shots", "_wegame_probe.png")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        auto.ControlFromHandle(hwnd).CaptureToImage(p)
+        return _classify_wegame_row(Image.open(p).convert("RGB"), 0)
+    except Exception as e:
+        log("读 WeGame 截图失败: %r" % (e,))
+        return None
+
+
+def start_wegame_probe(delay=25):
+    """WeGame 战绩要等几秒才刷新，所以延迟去读，别卡住主循环。"""
+    _WG["done"] = False
+    _WG["win"] = None
+
+    def _run():
+        try:
+            time.sleep(delay)
+            w = read_wegame_latest_win()
+            _WG["win"] = w
+            if w is not None:
+                log("WeGame 战绩: 最近一局 %s" % ("赢了" if w else "输了"))
+            else:
+                log("WeGame 没读到战绩，准备弹窗问")
+        except Exception as e:
+            log("WeGame 探测异常: %r" % (e,))
+        finally:
+            _WG["done"] = True
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 _ASK = {"pending": False, "result": None}
 
 
@@ -812,8 +927,9 @@ def tick(st):
         st["await_deadline"] = now + ASK_WAIT
         save_state(st)
         log("一局结束，等确认胜负（最多 %d 秒）" % ASK_WAIT)
+        snapshot_on_game_end()
         if WIN_TO_SLEEP and count >= LIMIT:
-            ask_result_async()            # 只有打满额度才打扰
+            start_wegame_probe()          # 先让程序自己去 WeGame 读，读不到再弹窗
 
     if in_game:
         # 局内一律不打断：硬断算秒退，掉分还吃排队惩罚
@@ -854,7 +970,18 @@ def tick(st):
     if not (HARD_CAP and count >= HARD_CAP):   # 兜底上限优先
         if WIN_TO_SLEEP:                       # 选项「赢一把就睡觉」
             if st.get("awaiting"):
-                if _ASK["result"] is not None:          # 本人点过弹窗
+                if _WG["done"] and _WG["win"] is not None:
+                    st["last_win"] = _WG["win"]
+                    _WG.update({"done": False, "win": None})
+                    st["awaiting"] = False
+                    save_state(st)
+                    log("自动判定: %s（来自 WeGame 战绩）"
+                        % ("赢了" if st["last_win"] else "输了"))
+                elif _WG["done"] and _WG["win"] is None:
+                    _WG["done"] = False
+                    log("WeGame 读不到，改弹窗问")
+                    ask_result_async()
+                elif _ASK["result"] is not None:          # 本人点过弹窗
                     st["last_win"] = _ASK["result"]
                     _ASK["result"] = None
                     st["awaiting"] = False
