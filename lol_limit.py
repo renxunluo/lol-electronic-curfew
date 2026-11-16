@@ -810,6 +810,92 @@ def read_wegame_latest_win():
     return _classify_wegame_row(img, 0)
 
 
+def _find_twincontrol():
+    """WeGame 局末弹的「赛后评价」浮层，窗口类是 TWINCONTROL。"""
+    try:
+        hwnds = []
+        user32 = ctypes.windll.user32
+
+        def _cb(h, l):
+            if user32.IsWindowVisible(h):
+                b = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(h, b, 256)
+                if b.value == "TWINCONTROL":
+                    hwnds.append(h)
+            return True
+
+        CB = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        user32.EnumWindows(CB(_cb), 0)
+        return hwnds[0] if hwnds else None
+    except Exception:
+        return None
+
+
+def _grab_window(hwnd):
+    try:
+        from PIL import ImageGrab
+        r = wt.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+        if r.right - r.left < 200 or r.bottom - r.top < 150:
+            return None
+        return ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
+    except Exception:
+        return None
+
+
+def _match_tpl(img, name, thresh=0.75):
+    """在图片里找模板（tpl/<name>.png），返回最高匹配度。
+
+    注意：cv2.imread 在 Windows 上读不了中文路径，所以模板用 PIL 读再转 BGR。
+    """
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpl", name + ".png")
+        if not os.path.exists(p):
+            return 0.0
+        a = np.array(img.convert("RGB"))[:, :, ::-1].copy()
+        t = np.array(Image.open(p).convert("RGB"))[:, :, ::-1].copy()
+        if t.shape[0] > a.shape[0] or t.shape[1] > a.shape[1]:
+            return 0.0
+        return float(cv2.matchTemplate(a, t, cv2.TM_CCOEFF_NORMED).max())
+    except Exception as e:
+        log("模板匹配失败(%s): %r" % (name, e))
+        return 0.0
+
+
+# 浮层固定按这个尺寸比对（模板就是照这个尺寸抠的）
+_POPUP_SIZE = (423, 523)
+
+
+def read_result_popup(old_hwnd=None, retries=3):
+    """读赛后院评浮层：出现 SVP 徽章 = 输了；MVP = 赢了。
+
+    old_hwnd 是开打前就存在的旧浮层，要排除掉，免得读到上一局的。
+    浮层刚弹出时有动画，偶发认不出，所以重试几次。
+    返回 True=赢 / False=输 / None=认不出。
+    """
+    for i in range(retries):
+        hwnd = _find_twincontrol()
+        if not hwnd or (old_hwnd and hwnd == old_hwnd):
+            return None                       # 没有新浮层，重试也没用
+        img = _grab_window(hwnd)
+        if img is not None:
+            try:
+                img = img.resize(_POPUP_SIZE)
+            except Exception:
+                img = None
+        if img is not None:
+            if _match_tpl(img, "svp") > 0.75:
+                return False                  # SVP -> 这局输了
+            if _match_tpl(img, "mvp") > 0.75:
+                return True                   # MVP -> 这局赢了
+        if i < retries - 1:
+            time.sleep(0.5)
+    return None
+
+
 def start_wegame_probe(delay=25):
     """游戏结束后延迟去读。
 
@@ -824,6 +910,13 @@ def start_wegame_probe(delay=25):
         try:
             time.sleep(delay)
             for attempt in range(7):          # 25 + 6×10 ≈ 85 秒
+                # 先看局末浮层（它几秒就弹，而且就是这一局的）
+                w = read_result_popup(_WG.get("old_popup"))
+                if w is not None:
+                    _WG["win"] = w
+                    log("浮层判定: %s（%s 徽章）"
+                        % ("赢了" if w else "输了", "MVP" if w else "SVP"))
+                    break
                 img = _capture_wegame()
                 if img is not None:
                     fp = _row_fingerprint(img)
@@ -848,6 +941,9 @@ def start_wegame_probe(delay=25):
             _WG["done"] = True
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+
 
 
 _ASK = {"pending": False, "result": None}
@@ -980,6 +1076,7 @@ def tick(st):
         # 记下开打前 WeGame 战绩第一行的样子，局末用来确认它有没有刷新
         _img = _capture_wegame()
         _WG["baseline"] = _row_fingerprint(_img) if _img is not None else None
+        _WG["old_popup"] = _find_twincontrol()   # 局末只认新弹出的浮层
     elif (not in_game) and was:
         st["was_in_game"] = False
         st["awaiting"] = True
