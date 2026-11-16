@@ -843,23 +843,57 @@ def _grab_window(hwnd):
         return None
 
 
-def _match_tpl(img, name, thresh=0.75):
-    """在图片里找模板（tpl/<name>.png），返回最高匹配度。
+_TPL_CACHE = {}
 
-    注意：cv2.imread 在 Windows 上读不了中文路径，所以模板用 PIL 读再转 BGR。
-    """
+
+def _load_tpl(name):
+    """读模板（PIL，避免 cv2.imread 读不了中文路径）。"""
+    if name in _TPL_CACHE:
+        return _TPL_CACHE[name]
     try:
-        import cv2
         import numpy as np
         from PIL import Image
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpl", name + ".png")
         if not os.path.exists(p):
-            return 0.0
-        a = np.array(img.convert("RGB"))[:, :, ::-1].copy()
+            return None
         t = np.array(Image.open(p).convert("RGB"))[:, :, ::-1].copy()
-        if t.shape[0] > a.shape[0] or t.shape[1] > a.shape[1]:
+        _TPL_CACHE[name] = t
+        return t
+    except Exception:
+        return None
+
+
+# 覆盖 100%~250% 的 DPI 缩放和 1080p/2K/4K 的尺寸差异
+_TPL_SCALES = (0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.0,
+               1.1, 1.25, 1.4, 1.6, 1.8, 2.0, 2.25, 2.5)
+
+
+def _match_tpl(img, name, thresh=0.75):
+    """多尺度模板匹配：同一套模板适配 1080p / 2K / 4K 和各种缩放比例。"""
+    try:
+        import cv2
+        import numpy as np
+        a = np.array(img.convert("RGB"))[:, :, ::-1].copy()
+        t0 = _load_tpl(name)
+        if t0 is None:
             return 0.0
-        return float(cv2.matchTemplate(a, t, cv2.TM_CCOEFF_NORMED).max())
+        best = 0.0
+        for s in _TPL_SCALES:
+            h = int(round(t0.shape[0] * s))
+            w = int(round(t0.shape[1] * s))
+            if h < 6 or w < 6 or h > a.shape[0] or w > a.shape[1]:
+                continue
+            interp = cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC
+            t = cv2.resize(t0, (w, h), interpolation=interp)
+            v = float(cv2.matchTemplate(a, t, cv2.TM_CCOEFF_NORMED).max())
+            if v > best:
+                best = v
+                if best > 0.93:          # 够准了，不用再试别的尺度
+                    break
+        return best
+    except Exception as e:
+        log("模板匹配失败(%s): %r" % (name, e))
+        return 0.0
     except Exception as e:
         log("模板匹配失败(%s): %r" % (name, e))
         return 0.0
@@ -882,11 +916,7 @@ def read_result_popup(old_hwnd=None, retries=3):
             return None                       # 没有新浮层，重试也没用
         img = _grab_window(hwnd)
         if img is not None:
-            try:
-                img = img.resize(_POPUP_SIZE)
-            except Exception:
-                img = None
-        if img is not None:
+            # 不做固定尺寸缩放，交给多尺度匹配处理，这样 1080p/2K/4K 都能认
             if _match_tpl(img, "svp") > 0.75:
                 return False                  # SVP -> 这局输了
             if _match_tpl(img, "mvp") > 0.75:
