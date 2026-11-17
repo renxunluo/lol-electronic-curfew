@@ -49,7 +49,7 @@ RESET_HOUR = 0                 # 几点换日（0 = 自然日 0 点）
 GRACE_SECONDS = 10             # 局末留几秒看结算，再关客户端
 POLL_PROC = 1.0                # 主循环间隔（秒）
 ASK_WAIT = 90                  # 弹窗最多等多久，超时按"赢了"处理
-REMAKE_SECONDS = 180           # 一局不到 3 分钟就当重开局，不占额度、不判输赢
+REMAKE_SECONDS = 480           # 一局不到 8 分钟就当重开局（大乱斗投降线是 8 分钟）
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
 LOL_ROOT = r"D:\WeGameApps\英雄联盟"   # 运行时会被自动探测覆盖
