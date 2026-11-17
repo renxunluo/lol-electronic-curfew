@@ -49,6 +49,7 @@ RESET_HOUR = 0                 # 几点换日（0 = 自然日 0 点）
 GRACE_SECONDS = 10             # 局末留几秒看结算，再关客户端
 POLL_PROC = 1.0                # 主循环间隔（秒）
 ASK_WAIT = 90                  # 弹窗最多等多久，超时按"赢了"处理
+REMAKE_SECONDS = 180           # 一局不到 3 分钟就当重开局，不占额度、不判输赢
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
 LOL_ROOT = r"D:\WeGameApps\英雄联盟"   # 运行时会被自动探测覆盖
@@ -1025,6 +1026,8 @@ def evaluate(st):
 
     hard = count_game_logs(today)
     count = max(hard, len(st["seen"]))
+    remade = len(st.get("remade") or [])
+    count = max(0, count - remade)
     finished = count - (1 if games else 0)      # 正在跑的那局算还没结束
     return count, max(finished, 0), games, clients, hard, len(st["seen"])
 
@@ -1102,6 +1105,7 @@ def tick(st):
     was = bool(st.get("was_in_game"))
     if in_game and not was:
         st["was_in_game"] = True
+        st["game_started_at"] = now
         save_state(st)
         # 记下开打前 WeGame 战绩第一行的样子，局末用来确认它有没有刷新
         _img = _capture_wegame()
@@ -1109,6 +1113,18 @@ def tick(st):
         _WG["old_popup"] = _find_twincontrol()   # 局末只认新弹出的浮层
     elif (not in_game) and was:
         st["was_in_game"] = False
+        dur = now - float(st.get("game_started_at") or 0)
+        if st.get("game_started_at") and dur < REMAKE_SECONDS:
+            # 重开局 / 秒退：不满 3 分钟，LOL 里不算战绩，这里也不占额度、不判输赢
+            st["remade"] = list(st.get("remade") or []) + [st["game_started_at"]]
+            if st.get("seen"):
+                st["seen"].pop()
+            st["awaiting"] = False
+            st["game_started_at"] = 0.0
+            save_state(st)
+            log("疑似重开局（只打了 %d 秒），不计入额度、不判输赢" % int(dur))
+            return
+        st["game_started_at"] = 0.0
         st["awaiting"] = True
         st["await_deadline"] = now + ASK_WAIT
         save_state(st)
