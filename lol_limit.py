@@ -48,7 +48,7 @@ HARD_CAP = 0                   # 绝对上限（0 = 不设限）。设 10 就是
 RESET_HOUR = 0                 # 几点换日（0 = 自然日 0 点）
 GRACE_SECONDS = 10             # 局末留几秒看结算，再关客户端
 POLL_PROC = 1.0                # 主循环间隔（秒）
-ASK_WAIT = 90                  # 弹窗最多等多久，超时按"赢了"处理
+ASK_WAIT = 60                  # 局末最多等多久确认胜负，超时按"赢了"处理
 REMAKE_SECONDS = 480           # 一局不到 8 分钟就当重开局（大乱斗投降线是 8 分钟）
 LOG_MAX_BYTES = 2 * 1024 * 1024
 
@@ -927,11 +927,12 @@ def read_result_popup(old_hwnd=None, retries=3):
     return None
 
 
-def start_wegame_probe(delay=25):
+def start_wegame_probe(delay=8):
     """游戏结束后延迟去读。
 
-    WeGame 要等几秒才刷新战绩，所以先用「第一行指纹」确认它真的更新了：
-    对不上就继续等（最多再多等 60 秒），还是对不上就当读不到、退回弹窗。
+    浮层几秒就弹，所以先等 8 秒就看；读不到再隔 7 秒重试，最多 4 轮（约 30 秒），
+    还不行就当读不到、立刻弹窗问人——别让主人干等一分钟。
+    WeGame 要等几秒才刷新战绩，所以先用「第一行指纹」确认它真的更新了。
     """
     _WG["done"] = False
     _WG["win"] = None
@@ -940,7 +941,7 @@ def start_wegame_probe(delay=25):
     def _run():
         try:
             time.sleep(delay)
-            for attempt in range(7):          # 25 + 6×10 ≈ 85 秒
+            for attempt in range(4):          # 8 + 3×7 ≈ 29 秒
                 # 先看局末浮层（它几秒就弹，而且就是这一局的）
                 w = read_result_popup(_WG.get("old_popup"))
                 if w is not None:
@@ -962,8 +963,8 @@ def start_wegame_probe(delay=25):
                             break
                     else:
                         log("WeGame 还没刷新（指纹未变），继续等")
-                if attempt < 6:
-                    time.sleep(10)
+                if attempt < 3:
+                    time.sleep(7)
         except Exception as e:
             log("WeGame 探测异常: %r" % (e,))
         finally:
