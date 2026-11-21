@@ -904,6 +904,34 @@ def _match_tpl(img, name, thresh=0.75):
 _POPUP_SIZE = (423, 523)
 
 
+def _ocr_popup_result(img):
+    """OCR 兜底：读浮层上的「胜 / 败」两个字，模板匹配失手时用。
+
+    故意不缓存引擎——每次用完就释放，不占常驻内存（主人关心这个）。
+    小图先放大 2 倍再识别，小字号认得更稳；单张约 0.5 秒，只跑一次。
+    """
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        import numpy as np
+        im = img.convert("RGB")
+        if im.width < 900:                 # 浮层只有 400 多像素宽，放大后识字更准
+            im = im.resize((im.width * 2, im.height * 2))
+        engine = RapidOCR()
+        res, _ = engine(np.array(im))
+        text = "".join((line[1] or "") for line in (res or []))
+        has_lose = "败" in text
+        has_win = "胜" in text
+        if has_lose and not has_win:
+            return False
+        if has_win and not has_lose:
+            return True
+        log("OCR 认不出胜负（识别到: %s）" % text[:80])
+    except Exception as e:
+        log("OCR 兜底失败: %r" % (e,))
+    return None
+
+
+
 def read_result_popup(old_hwnd=None, retries=3):
     """读赛后院评浮层：出现 SVP 徽章 = 输了；MVP = 赢了。
 
