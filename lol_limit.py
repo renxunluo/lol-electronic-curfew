@@ -1075,6 +1075,7 @@ def run_daemon():
 
     log("守护启动 pid=%d 前%d把不拦 换日=%02d:00 今日=%s"
         % (os.getpid(), LIMIT, RESET_HOUR, day_key()))
+    start_tray()                      # 系统托盘挂个绿点，让人看得见服务在跑
 
     while True:
         try:
@@ -1082,6 +1083,82 @@ def run_daemon():
         except Exception:
             log("循环异常:\n" + traceback.format_exc())
         time.sleep(POLL_PROC)
+
+
+# ---------------------------------------------------------------- 系统托盘图标
+# 托盘里放个绿点，让人一眼看到「服务在跑」。pywin32 不在就静默跳过，不影响守护。
+TRAY = {"hwnd": None, "hicon": None, "thread": None}
+TRAY_TIP = "英雄联盟电子宵禁 · 守护运行中"
+_TRAY_LAST = {"tip": ""}
+
+
+def _make_tray_icon(color=(34, 197, 94)):
+    """画一个圆点图标（默认绿色=运行中）。返回 ico 路径。"""
+    from PIL import Image, ImageDraw
+    p = os.path.join(DATA_DIR, "tray.ico")
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((4, 4, 60, 60), fill=tuple(color) + (255,))
+    d.ellipse((22, 22, 42, 42), fill=(255, 255, 255, 255))
+    img.save(p, format="ICO")
+    return p
+
+
+def _tray_update_tip(text):
+    """改托盘的悬停提示。"""
+    try:
+        import win32gui
+        if TRAY["hwnd"]:
+            win32gui.Shell_NotifyIcon(
+                win32gui.NIM_MODIFY,
+                (TRAY["hwnd"], 0, win32gui.NIF_TIP, 0, 0, text[:120]))
+    except Exception:
+        pass
+
+
+def _tray_wndproc(hwnd, msg, wparam, lparam):
+    try:
+        import win32gui
+        import win32con
+        if msg == win32con.WM_DESTROY:
+            win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (hwnd, 0))
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+    except Exception:
+        return 0
+
+
+def start_tray():
+    """起系统托盘图标（后台线程）。"""
+    if TRAY["thread"]:
+        return
+
+    def _run():
+        try:
+            import win32gui
+            import win32con
+            import win32api
+            ico = _make_tray_icon()
+            wc = win32gui.WNDCLASS()
+            wc.lpfnWndProc = _tray_wndproc
+            wc.lpszClassName = "LolLimitTrayWnd"
+            wc.hInstance = win32api.GetModuleHandle(None)
+            atom = win32gui.RegisterClass(wc)
+            hwnd = win32gui.CreateWindow(
+                atom, "LolLimitTrayWnd", 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None)
+            hicon = win32gui.LoadImage(
+                0, ico, win32con.IMAGE_ICON, 0, 0, win32con.LR_LOADFROMFILE)
+            win32gui.Shell_NotifyIcon(
+                win32gui.NIM_ADD,
+                (hwnd, 0, win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP,
+                 win32con.WM_USER + 20, hicon, TRAY_TIP))
+            TRAY.update(hwnd=hwnd, hicon=hicon)
+            log("托盘图标已显示")
+            win32gui.PumpMessages()
+        except Exception as e:
+            log("托盘图标启动失败: %r" % (e,))
+
+    TRAY["thread"] = threading.Thread(target=_run, daemon=True)
+    TRAY["thread"].start()
 
 
 def tick(st):
@@ -1100,6 +1177,24 @@ def tick(st):
 
     now = time.time()
     in_game = bool(games)
+
+    # 托盘提示跟着状态走（只在变化时更新，免得每秒刷 Shell_NotifyIcon）
+    try:
+        if count >= lim:
+            if st.get("last_win") is True:
+                _tip_state = "今天已收工（再开会被关）"
+            elif st.get("last_win") is False:
+                _tip_state = "输了可以继续，赢一把收工"
+            else:
+                _tip_state = "额度已满，等你打完这局"
+        else:
+            _tip_state = "监控中，还剩 %d 把" % max(0, lim - count)
+        _tip = "英雄联盟电子宵禁 · 今日 %d/%d 把 · %s" % (count, lim, _tip_state)
+        if _tip != _TRAY_LAST["tip"]:
+            _TRAY_LAST["tip"] = _tip
+            _tray_update_tip(_tip)
+    except Exception:
+        pass
 
     # 进/出对局的状态机：出局后要问一句结果
     was = bool(st.get("was_in_game"))
