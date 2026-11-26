@@ -720,8 +720,8 @@ def reload_if_changed():
     if m != _CFG_MTIME["v"]:
         _CFG_MTIME["v"] = m
         if apply_config(read_config()):
-            log("配置: 前%d把不拦 / 赢一把就睡觉=%s / 宽限%d秒 / 换日%02d:00"
-                % (LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR))
+            log("配置: %s / 赢一把就睡觉=%s / 宽限%d秒 / 换日%02d:00"
+                % (quota_text(), WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR))
 
 
 _POPUP_TS = {}
@@ -1102,6 +1102,14 @@ def ask_result_async():
     threading.Thread(target=_run, daemon=True).start()
 
 
+def quota_text():
+    """日志里用的额度描述：按局数 or 按时间。"""
+    if MODE == "time":
+        m = TIME_LIMIT_MIN
+        return ("每天 %d 小时" % (m // 60)) if m % 60 == 0 else ("每天 %d 分钟" % m)
+    return "前 %d 把不拦" % LIMIT
+
+
 def time_used_today(st):
     """时间模式：今天累计打了多少秒（含正在进行的这一局）。"""
     acc = float(st.get("time_today_sec") or 0.0)
@@ -1186,8 +1194,8 @@ def run_daemon():
         st = fresh_state(st)
         save_state(st)
 
-    log("守护启动 pid=%d 前%d把不拦 换日=%02d:00 今日=%s"
-        % (os.getpid(), LIMIT, RESET_HOUR, day_key()))
+    log("守护启动 pid=%d %s 换日=%02d:00 今日=%s"
+        % (os.getpid(), quota_text(), RESET_HOUR, day_key()))
     start_tray()                      # 系统托盘挂个绿点，让人看得见服务在跑
 
     while True:
