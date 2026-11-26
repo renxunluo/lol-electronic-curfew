@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-每日限额守护 —— 给管不住自己开黑的你
+英雄联盟每日限额守护  lol_limit.py
 
 规则（默认）：
   前 5 把随便打，不打扰。
@@ -8,8 +8,6 @@
     赢了 -> 今天收工，关客户端
     输了 -> 放行，接着打，直到赢一把为止
   自然日 0 点自动重置。
-
-还能设限时封锁（最多两个时段）和工作日禁打，见 README。
 
 计数依据（双保险，取大者）：
   1) Game\\Logs\\GameLogs\\ 下当天新建的时间戳目录（每进一局必建一个）
@@ -19,10 +17,14 @@
 这个脚本只做三件事：读目录名、看进程、结束进程。
 不注入、不读内存、不改游戏文件、不访问客户端接口、不碰对局内数据。
 
-快速开始：
-  双击 install.bat   —— 装开机自启并启动守护
-  双击 ui.bat        —— 打开界面
-  双击 uninstall.bat —— 卸掉
+用法：
+  python lol_limit.py run       守护模式（开机自启用它，pythonw 无窗口）
+  python lol_limit.py status    看今天打了几把（会顺手拉起守护）
+  python lol_limit.py once      只判断一次（不杀进程）
+  python lol_limit.py install   装开机自启 + 启动守护
+  python lol_limit.py uninstall 卸开机自启 + 停掉守护
+  python lol_limit.py restart   改完参数后重启守护
+  python lol_limit.py giveup    【不解锁】只反问你两个问题
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -41,9 +43,23 @@ import traceback
 # 或者直接改 %LOCALAPPDATA%\LolLimit\config.json（守护会自动重载）。
 LIMIT = 5                      # 前几把不拦
 MAX_LIMIT = 5                  # 额度硬上限（0 = 不限）；自用版锁死 5，调不上去
+
+# ---------------- 学习换额度（配合「一建经验条」，2026-11-15 主人要求）----------------
+# 没学够只给 STUDY_BASE_LIMIT 把；学满 STUDY_GOAL_MIN 分钟才恢复到 LIMIT 把。
+# 只会把额度往下压，永远不超过 LIMIT —— 这不是解锁通道，不违反"绝不留后门"。
+STUDY_SWITCH = True
+STUDY_BASE_LIMIT = 2
+STUDY_GOAL_MIN = 90
+STUDY_STATE = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "YijianXP", "state.json")
+
 BLOCK_RANGES = []              # 封锁时段 [(s,e), ...]，最多两个
 WORKDAY_BLOCK = False          # 工作日（周一到周五）全天不许打
 WIN_TO_SLEEP = True            # 选项「赢一把就睡觉」：满额后赢一把才关，输了可继续
+MODE = "games"                 # 额度模式：games=按局数，time=按时间
+TIME_LIMIT_MIN = 120           # 时间模式：每天最多打多少分钟
+NO_EXIT = True                 # 自用版：不给卸载入口，另装看门狗自动复活
+WATCH_TASK = "LolLimitGuardWatch"   # 看门狗计划任务名
 HARD_CAP = 0                   # 绝对上限（0 = 不设限）。设 10 就是再输也不许超 10 把
 RESET_HOUR = 0                 # 几点换日（0 = 自然日 0 点）
 GRACE_SECONDS = 10             # 局末留几秒看结算，再关客户端
@@ -388,6 +404,9 @@ def fresh_state(prev=None):
         "await_deadline": 0.0,
         "was_in_game": False,
         "block_until": 0.0,               # 时间封锁时的宽限计时
+        "game_started_at": 0.0,           # 这一局开始的时刻（算时长用）
+        "time_today_sec": 0.0,            # 时间模式：今天累计打了多少秒
+        "remade": [],                     # 重开局/秒退的时间戳，从当天额度里剔除
     }
 
 
@@ -428,6 +447,11 @@ _DEFAULTS = {
     "lol_root": "",          # 留空 = 自动探测
     "block_ranges": [],      # 最多两个「HH:MM-HH:MM」，这些时段不许打
     "workday_block": False,  # 工作日（周一到周五）全天不许打
+    "study_switch": True,    # 学习换额度开关
+    "study_base_limit": 2,   # 没学够时今天只给几把
+    "debug_until": 0,        # 调试窗口截止时间戳（只暂停拦截，额度照扣）
+    "mode": "games",         # 额度模式：games=按局数，time=按时间
+    "time_limit_minutes": 120,   # 时间模式：每天最多打多少分钟
 }
 _CFG_MTIME = {"v": -1.0}
 
@@ -459,9 +483,9 @@ def write_config(cfg):
 def apply_config(cfg):
     """把配置套到全局变量上；返回是否真的有变化。"""
     global LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT
-    global MAX_LIMIT, BLOCK_RANGES, WORKDAY_BLOCK
+    global MAX_LIMIT, BLOCK_RANGES, WORKDAY_BLOCK, MODE, TIME_LIMIT_MIN
     old = (LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT,
-           MAX_LIMIT, tuple(BLOCK_RANGES), WORKDAY_BLOCK)
+           MAX_LIMIT, tuple(BLOCK_RANGES), WORKDAY_BLOCK, MODE, TIME_LIMIT_MIN)
 
     LIMIT = max(1, int(cfg.get("limit", 5)))
     MAX_LIMIT = max(0, int(cfg.get("max_limit", 0)))
@@ -471,6 +495,10 @@ def apply_config(cfg):
     GRACE_SECONDS = max(0, int(cfg.get("grace_seconds", 10)))
     RESET_HOUR = int(cfg.get("reset_hour", 0)) % 24
     HARD_CAP = max(0, int(cfg.get("hard_cap", 0)))
+    MODE = str(cfg.get("mode", "games")).lower()
+    if MODE not in ("games", "time"):
+        MODE = "games"
+    TIME_LIMIT_MIN = max(10, min(600, int(cfg.get("time_limit_minutes", 120))))
     BLOCK_RANGES = _parse_ranges(cfg.get("block_ranges"))
     WORKDAY_BLOCK = bool(cfg.get("workday_block", False))
 
@@ -482,6 +510,44 @@ def apply_config(cfg):
 
     return old != (LIMIT, WIN_TO_SLEEP, GRACE_SECONDS, RESET_HOUR, HARD_CAP, LOL_ROOT,
                    MAX_LIMIT, tuple(BLOCK_RANGES), WORKDAY_BLOCK)
+
+
+# ------------------------------------------------ 学习换额度
+def study_today_seconds():
+    """读「一建经验条」的今日有效学习秒数。读不到就返回 0（当作没学）。"""
+    try:
+        with open(STUDY_STATE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("date") != day_key():
+            return 0
+        return max(0, int(d.get("today_sec", 0)))
+    except Exception:
+        return 0
+
+
+def study_met():
+    return study_today_seconds() >= STUDY_GOAL_MIN * 60
+
+
+def effective_limit():
+    """今天真正生效的额度。
+
+    没学够 -> STUDY_BASE_LIMIT 把；学满了 -> 配置里的 LIMIT 把。
+    返回值永远 <= LIMIT，只会把额度往下压，所以不存在"学习解锁"的漏洞。
+    """
+    if not STUDY_SWITCH:
+        return LIMIT
+    base = STUDY_BASE_LIMIT
+    try:
+        cfg = read_config()
+        if not bool(cfg.get("study_switch", True)):
+            return LIMIT
+        base = max(1, int(cfg.get("study_base_limit", STUDY_BASE_LIMIT)))
+    except Exception:
+        pass
+    if study_met():
+        return LIMIT
+    return min(base, LIMIT)
 
 
 def _parse_ranges(raw):
@@ -681,29 +747,6 @@ def popup(text, title="英雄联盟 · 每日限额"):
 # --------------------------------------------- 战后确认：赢了吗？
 # 国服客户端把本地接口锁死了（lockfile 恒为 0 字节、命令行读不到），
 # 读不到自动胜负，只能在打满额度后问一句。
-def snapshot_on_game_end():
-    """每局结束抓一张屏，存到 +shots（诊断用，也方便以后做识别）。"""
-    try:
-        from PIL import ImageGrab
-        d = os.path.join(DATA_DIR, "shots")
-        os.makedirs(d, exist_ok=True)
-        p = os.path.join(d, datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".png")
-        try:
-            img = ImageGrab.grab(all_screens=True)   # 双屏也要截全
-        except TypeError:
-            img = ImageGrab.grab()
-        img.save(p)
-        log("对局结束截图: %s (%dx%d)" % (p, img.size[0], img.size[1]))
-        files = sorted(os.listdir(d))
-        for old in files[:-20]:
-            try:
-                os.remove(os.path.join(d, old))
-            except OSError:
-                pass
-    except Exception as e:
-        log("截图失败: %r" % (e,))
-
-
 # --------------------------------------------- 从 WeGame 战绩列表自动读胜负
 # WeGame 主界面右侧「历史战绩」每行都写着 胜利(青绿) / 失败(红)。
 # 截窗口 → 取第一行结果列的颜色 → 判胜负。读不到再退回弹窗问人。
@@ -772,7 +815,10 @@ def _classify_wegame_row(img, row=0):
 
 
 def _capture_wegame():
-    """截 WeGame 窗口，返回 PIL Image 或 None。"""
+    """截 WeGame 窗口，返回 PIL Image 或 None。
+
+    WeGame 被最小化时截出来是黑图，所以先恢复；截完再最小化回去，尽量不打扰。
+    """
     try:
         import uiautomation as auto
         from PIL import Image
@@ -781,14 +827,31 @@ def _capture_wegame():
     hwnd = _find_wegame_window()
     if not hwnd:
         return None
+    u32 = ctypes.windll.user32
+    was_min = bool(u32.IsIconic(hwnd))
     try:
-        p = os.path.join(DATA_DIR, "shots", "_wegame_probe.png")
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        auto.ControlFromHandle(hwnd).CaptureToImage(p)
-        return Image.open(p).convert("RGB")
+        if was_min:
+            # WeGame 会拦截 ShowWindow，得走 WM_SYSCOMMAND / SC_RESTORE
+            u32.PostMessageW(hwnd, 0x0112, 0xF120, 0)
+            time.sleep(1.2)
+        u32.SetForegroundWindow(hwnd)    # 置顶，免得被别的窗口挡住
+        time.sleep(0.8)
+        ctrl = auto.ControlFromHandle(hwnd)
+        r = ctrl.BoundingRectangle        # UIA 给的是物理像素，正好给 ImageGrab 用
+        from PIL import ImageGrab
+        img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True)
+        if img is None or img.size[0] < 200:
+            return None
+        return img.convert("RGB")
     except Exception as e:
         log("截 WeGame 失败: %r" % (e,))
         return None
+    finally:
+        if was_min:
+            try:
+                u32.ShowWindow(hwnd, 6)  # SW_MINIMIZE，还原成原来的样子
+            except Exception:
+                pass
 
 
 def _row_fingerprint(img, row=0):
@@ -895,9 +958,6 @@ def _match_tpl(img, name, thresh=0.75):
     except Exception as e:
         log("模板匹配失败(%s): %r" % (name, e))
         return 0.0
-    except Exception as e:
-        log("模板匹配失败(%s): %r" % (name, e))
-        return 0.0
 
 
 # 浮层固定按这个尺寸比对（模板就是照这个尺寸抠的）
@@ -931,27 +991,33 @@ def _ocr_popup_result(img):
     return None
 
 
-
 def read_result_popup(old_hwnd=None, retries=3):
     """读赛后院评浮层：出现 SVP 徽章 = 输了；MVP = 赢了。
 
     old_hwnd 是开打前就存在的旧浮层，要排除掉，免得读到上一局的。
-    浮层刚弹出时有动画，偶发认不出，所以重试几次。
+    浮层刚弹出时有动画，偶发认不出，所以重试几次；模板都失手时用 OCR 兜底。
     返回 True=赢 / False=输 / None=认不出。
     """
+    last_img = None
     for i in range(retries):
         hwnd = _find_twincontrol()
         if not hwnd or (old_hwnd and hwnd == old_hwnd):
             return None                       # 没有新浮层，重试也没用
         img = _grab_window(hwnd)
         if img is not None:
-            # 不做固定尺寸缩放，交给多尺度匹配处理，这样 1080p/2K/4K 都能认
+            last_img = img
             if _match_tpl(img, "svp") > 0.75:
                 return False                  # SVP -> 这局输了
             if _match_tpl(img, "mvp") > 0.75:
                 return True                   # MVP -> 这局赢了
         if i < retries - 1:
             time.sleep(0.5)
+    # 模板都没对上，OCR 再试一次
+    if last_img is not None:
+        r = _ocr_popup_result(last_img)
+        if r is not None:
+            log("OCR 兜底判定: %s" % ("赢了" if r else "输了"))
+        return r
     return None
 
 
@@ -1036,6 +1102,22 @@ def ask_result_async():
     threading.Thread(target=_run, daemon=True).start()
 
 
+def time_used_today(st):
+    """时间模式：今天累计打了多少秒（含正在进行的这一局）。"""
+    acc = float(st.get("time_today_sec") or 0.0)
+    started = float(st.get("game_started_at") or 0.0)
+    if started and st.get("was_in_game"):
+        acc += max(0.0, time.time() - started)
+    return acc
+
+
+def is_full(st, count, lim):
+    """今天是否已经打满额度。支持两种模式：按局数 / 按时间。"""
+    if MODE == "time":
+        return time_used_today(st) >= TIME_LIMIT_MIN * 60
+    return count >= lim
+
+
 def evaluate(st):
     """返回 (count, finished, games, clients, hard, seen_n)。"""
     today = day_key()
@@ -1055,6 +1137,7 @@ def evaluate(st):
 
     hard = count_game_logs(today)
     count = max(hard, len(st["seen"]))
+    # 重开局/秒退不占额度：从计数里剔掉
     remade = len(st.get("remade") or [])
     count = max(0, count - remade)
     finished = count - (1 if games else 0)      # 正在跑的那局算还没结束
@@ -1077,7 +1160,8 @@ def mutex_acquire():
     h = k32.CreateMutexW(None, False, MUTEX_NAME)
     if not h:
         return None
-    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+    # 必须问 kernel32 要错误码：ctypes.get_last_error() 在没开 use_last_error 时恒为 0
+    if k32.GetLastError() == ERROR_ALREADY_EXISTS:
         k32.CloseHandle(h)
         return None
     return h
@@ -1112,6 +1196,41 @@ def run_daemon():
         except Exception:
             log("循环异常:\n" + traceback.format_exc())
         time.sleep(POLL_PROC)
+
+
+def snapshot_on_game_end():
+    """局末连拍几张，抓 WeGame 右下角那个「对局结束评分窗口」。
+
+    WeGame 的战报浮层是局末几秒才弹出来的，只拍一张容易错过，所以隔 3 秒拍一张，
+    连拍 6 张，存成 *burst*.png，方便事后看浮层长什么样。
+    """
+    def _run():
+        try:
+            from PIL import ImageGrab
+            d = os.path.join(DATA_DIR, "shots")
+            os.makedirs(d, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            for i in range(6):
+                time.sleep(3)
+                try:
+                    img = ImageGrab.grab()          # 主屏（浮层在主屏右下角）
+                    w, h = img.size
+                    img.resize((w // 2, h // 2)).save(
+                        os.path.join(d, "%s_burst%d.png" % (ts, i)))
+                except Exception as e:
+                    log("连拍 %d 失败: %r" % (i, e))
+            log("局末连拍完成: %s_burst0..5.png" % ts)
+            # 只留最近 40 张（约 6~7 局的连拍）
+            files = sorted(f for f in os.listdir(d) if "burst" in f)
+            for old in files[:-40]:
+                try:
+                    os.remove(os.path.join(d, old))
+                except OSError:
+                    pass
+        except Exception as e:
+            log("连拍异常: %r" % (e,))
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------- 系统托盘图标
@@ -1176,13 +1295,14 @@ def start_tray():
                 atom, "LolLimitTrayWnd", 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None)
             hicon = win32gui.LoadImage(
                 0, ico, win32con.IMAGE_ICON, 0, 0, win32con.LR_LOADFROMFILE)
-            win32gui.Shell_NotifyIcon(
+            ok = win32gui.Shell_NotifyIcon(
                 win32gui.NIM_ADD,
                 (hwnd, 0, win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP,
                  win32con.WM_USER + 20, hicon, TRAY_TIP))
             TRAY.update(hwnd=hwnd, hicon=hicon)
-            log("托盘图标已显示")
+            log("托盘图标已显示 (hwnd=%s hicon=%s 返回=%s)" % (hwnd, hicon, ok))
             win32gui.PumpMessages()
+            log("托盘消息循环结束（图标会消失）")
         except Exception as e:
             log("托盘图标启动失败: %r" % (e,))
 
@@ -1204,21 +1324,32 @@ def tick(st):
 
     count, finished, games, clients, hard, seen_n = evaluate(st)
 
+    # 今天的额度：没学够一建 = 2 把，学满 = 5 把（只会往下压）
+    lim = effective_limit()
+    full = is_full(st, count, lim)
+
     now = time.time()
     in_game = bool(games)
 
     # 托盘提示跟着状态走（只在变化时更新，免得每秒刷 Shell_NotifyIcon）
     try:
-        if count >= lim:
+        if full:
             if st.get("last_win") is True:
                 _tip_state = "今天已收工（再开会被关）"
             elif st.get("last_win") is False:
                 _tip_state = "输了可以继续，赢一把收工"
             else:
                 _tip_state = "额度已满，等你打完这局"
+        elif MODE == "time":
+            used_min = int(time_used_today(st) // 60)
+            _tip_state = "监控中，还剩 %d 分钟" % max(0, TIME_LIMIT_MIN - used_min)
         else:
             _tip_state = "监控中，还剩 %d 把" % max(0, lim - count)
-        _tip = "英雄联盟电子宵禁 · 今日 %d/%d 把 · %s" % (count, lim, _tip_state)
+        if MODE == "time":
+            _tip = "英雄联盟电子宵禁 · 今日 %d/%d 分钟 · %s" % (
+                int(time_used_today(st) // 60), TIME_LIMIT_MIN, _tip_state)
+        else:
+            _tip = "英雄联盟电子宵禁 · 今日 %d/%d 把 · %s" % (count, lim, _tip_state)
         if _tip != _TRAY_LAST["tip"]:
             _TRAY_LAST["tip"] = _tip
             _tray_update_tip(_tip)
@@ -1249,13 +1380,24 @@ def tick(st):
             log("疑似重开局（只打了 %d 秒），不计入额度、不判输赢" % int(dur))
             return
         st["game_started_at"] = 0.0
+        st["time_today_sec"] = float(st.get("time_today_sec") or 0.0) + dur
         st["awaiting"] = True
         st["await_deadline"] = now + ASK_WAIT
         save_state(st)
-        log("一局结束，等确认胜负（最多 %d 秒）" % ASK_WAIT)
-        snapshot_on_game_end()
-        if WIN_TO_SLEEP and count >= LIMIT:
+        log("一局结束（本局 %d 分钟，今日累计 %d 分钟），等确认胜负（最多 %d 秒）"
+            % (dur // 60, st["time_today_sec"] // 60, ASK_WAIT))
+        snapshot_on_game_end()            # 抓一张结算画面，给以后自动判断用
+        if WIN_TO_SLEEP and full:
             start_wegame_probe()          # 先让程序自己去 WeGame 读，读不到再弹窗
+
+    # ---- 调试窗口：只暂停拦截，额度照扣；到点自动恢复 ----
+    # 必须放在状态机之后——否则连拍和进出对局检测会被一起跳过（踩过这个坑）
+    try:
+        dbg_until = float(read_config().get("debug_until", 0) or 0)
+    except Exception:
+        dbg_until = 0.0
+    if dbg_until and time.time() < dbg_until:
+        return
 
     if in_game:
         # 局内一律不打断：硬断算秒退，掉分还吃排队惩罚
@@ -1286,7 +1428,7 @@ def tick(st):
         st["block_until"] = 0.0
         save_state(st)
 
-    if count < LIMIT:                     # 前 N 把不拦
+    if not full:                          # 还没打满（按局数或按时间）
         if st.get("grace_until"):
             st["grace_until"] = 0.0
             save_state(st)
@@ -1321,7 +1463,7 @@ def tick(st):
                     save_state(st)
                     log("超时没确认，按赢了处理")
             if st.get("last_win") is False:
-                # 输了 -> 放行，让他再打一把（这正是想要的）
+                # 输了 -> 放行，让他再打一把（这正是主人要的）
                 if st.get("grace_until"):
                     st["grace_until"] = 0.0
                     save_state(st)
@@ -1342,7 +1484,14 @@ def tick(st):
             st["last_kill"] = now
             save_state(st)
             log("拦截成功，最近一局赢=%s" % st.get("last_win"))
-            popup("赢了，今天到这里。\n\n英雄联盟已关闭，明天 0 点自动恢复。")
+            if lim < LIMIT:
+                mins = study_today_seconds() // 60
+                popup("今天一建才学了 %d 分钟，没到 %d 分钟。\n\n"
+                      "所以今天只给 %d 把，已经用完了。\n"
+                      "去把一建学满 %d 分钟，今天就能回到 %d 把。\n\n"
+                      "英雄联盟已关闭。" % (mins, STUDY_GOAL_MIN, lim, STUDY_GOAL_MIN, LIMIT))
+            else:
+                popup("赢了，今天到这里。\n\n英雄联盟已关闭，明天 0 点自动恢复。")
 
 
 # ---------------------------------------------------------------- 命令
@@ -1373,8 +1522,11 @@ def _pythonw():
 
 def _start_daemon():
     """拉起守护，返回新 pid；失败返回 None。"""
+    pid = _daemon_pid()
+    if pid:
+        return pid              # 已经在跑，别乱删 PID 文件（删了 status 会误报）
     try:
-        os.remove(PID_FILE)          # 清掉旧 pid，免得把死进程当成新的
+        os.remove(PID_FILE)          # 确认没在跑，清掉残留 pid
     except OSError:
         pass
     subprocess.Popen([_pythonw(), os.path.abspath(__file__), "run"],
@@ -1392,16 +1544,26 @@ def cmd_status():
     if st["day"] != day_key():
         st = fresh_state(st)
     count, finished, games, clients, hard, seen_n = evaluate(st)
+    lim = effective_limit()
+    study_min = study_today_seconds() // 60
 
     print("=" * 50)
     print("  英雄联盟每日限额   %s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
     print("=" * 50)
     print("  规则            前 %d 把不拦 + %s"
-          % (LIMIT, "「赢一把就睡觉」" if WIN_TO_SLEEP else "满额即收工"))
+          % (lim, "「赢一把就睡觉」" if WIN_TO_SLEEP else "满额即收工"))
+    if lim < LIMIT:
+        print("  今日额度        %d 把（学满 %d 分钟可回到 %d 把）"
+              % (lim, STUDY_GOAL_MIN, LIMIT))
+    else:
+        print("  今日额度        %d 把（一建已学满 %d 分钟 ✅）" % (lim, STUDY_GOAL_MIN))
+    print("  一建进度        今天 %d / %d 分钟%s"
+          % (study_min, STUDY_GOAL_MIN,
+             "  ✅ 已达标" if study_met() else "  还差 %d 分钟" % (STUDY_GOAL_MIN - study_min)))
     print("  今日已开        %d 把" % count)
     print("  其中已结束      %d 把" % finished)
-    if count < LIMIT:
-        print("  还能再开        %d 把" % (LIMIT - count))
+    if count < lim:
+        print("  还能再开        %d 把" % (lim - count))
     else:
         win = st.get("last_win")
         if win is True:
@@ -1456,16 +1618,53 @@ def cmd_once():
     if st["day"] != day_key():
         st = fresh_state(st)
     count, finished, games, clients, hard, seen_n = evaluate(st)
-    print("今日已开 %d / 已结束 %d / 前 %d 把不拦 / 还能开 %d"
-          % (count, finished, LIMIT, max(0, LIMIT - count)))
+    lim = effective_limit()
+    print("今日已开 %d / 已结束 %d / 额度 %d 把 / 还能开 %d"
+          % (count, finished, lim, max(0, lim - count)))
+    print("一建已学 %d / %d 分钟%s"
+          % (study_today_seconds() // 60, STUDY_GOAL_MIN, "" if study_met() else "（学满回到 %d 把）" % LIMIT))
     print("对局日志 %d 个，守护记录 %d 个" % (hard, seen_n))
     print("游戏进程 %d 个，客户端进程 %d 个" % (len(games), len(clients)))
-    if count < LIMIT:
+    if count < lim:
         print("结论: 还没到额度 -> 放行")
     elif st.get("last_win") is False:
         print("结论: 上一把输了 -> 放行继续")
     else:
         print("结论: 额度已用完 -> 启动会被拦截")
+
+
+def cmd_ensure():
+    """看门狗：守护不在就拉起来。由计划任务每 2 分钟调用一次。"""
+    if _daemon_pid():
+        return 0
+    p = _start_daemon()
+    log("看门狗发现守护不在，已拉起 pid=%s" % p)
+    return 0
+
+
+def install_watchdog():
+    """装一个每 2 分钟跑一次的计划任务，被杀就复活。"""
+    script = os.path.abspath(__file__)
+    tr = '"%s" "%s" ensure' % (_pythonw(), script)
+    cmd = ["schtasks", "/Create", "/TN", WATCH_TASK, "/TR", tr,
+           "/SC", "MINUTE", "/MO", "2", "/F"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW)
+        ok = r.returncode == 0
+        if not ok:
+            log("看门狗安装失败: %s %s" % (r.stdout[:200], r.stderr[:200]))
+        return ok
+    except Exception as e:
+        log("看门狗安装异常: %r" % (e,))
+        return False
+
+
+def remove_watchdog():
+    try:
+        subprocess.run(["schtasks", "/Delete", "/TN", WATCH_TASK, "/F"],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        pass
 
 
 def cmd_install():
@@ -1477,6 +1676,12 @@ def cmd_install():
     log("已写入开机自启: %s" % cmd)
     print("已写入开机自启: HKCU\\...\\Run\\%s" % RUN_VALUE)
 
+    if NO_EXIT:
+        if install_watchdog():
+            print("看门狗已装：每 2 分钟检查一次，被杀会自动复活")
+        else:
+            print("看门狗没装上（可能权限不够），但守护本身照常工作")
+
     if _daemon_pid():
         print("守护已经在跑了 (pid %s)，不用重复启动。" % _daemon_pid())
         return
@@ -1485,6 +1690,15 @@ def cmd_install():
 
 
 def cmd_uninstall():
+    if NO_EXIT:
+        print("")
+        print("  这个版本没有卸载入口。")
+        print("")
+        print("  它每 2 分钟自己检查一次，被结束就会重新起来。")
+        print("  真要彻底关掉，得同时删掉：目录、计划任务、开机自启项。")
+        print("")
+        print("  要不要这么麻烦，你自己定。")
+        return
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
@@ -1492,6 +1706,7 @@ def cmd_uninstall():
         print("已删除开机自启")
     except FileNotFoundError:
         print("开机自启本来就没装")
+    remove_watchdog()
     pid = _daemon_pid()
     if pid:
         kill_pid(pid)
@@ -1610,6 +1825,31 @@ def cmd_set(args):
     print("已更新：%s = %s" % (key, shown))
 
 
+def cmd_debug():
+    """开一个限时调试窗口：只暂停拦截，额度照扣。"""
+    try:
+        mins = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    except ValueError:
+        mins = 30
+    mins = max(0, min(180, mins))
+    if mins == 0:
+        until = 0
+    else:
+        until = time.time() + mins * 60
+    cfg = read_config()
+    cfg["debug_until"] = until
+    write_config(cfg)
+    if not until:
+        log("调试窗口已关闭")
+        print("调试窗口已关闭，拦截恢复。")
+        return
+    expire = datetime.datetime.fromtimestamp(until).strftime("%H:%M:%S")
+    log("调试窗口开启 %d 分钟，到 %s 自动恢复拦截" % (mins, expire))
+    print("调试窗口已开：%d 分钟，到 %s 自动恢复。" % (mins, expire))
+    print("注意：额度照扣，不是解锁；到点自动恢复拦截。")
+    print("提前结束：python lol_limit.py debug 0")
+
+
 def cmd_giveup():
     """不解锁。只问那两个问题，并把"求过几次"记下来。"""
     st = load_state()
@@ -1617,12 +1857,18 @@ def cmd_giveup():
         st = fresh_state(st)
     st["giveups"] = int(st.get("giveups", 0)) + 1
     save_state(st)
-    log("用户请求解锁，第 %d 次，已拒绝" % st["giveups"])
+    log("主人想解锁，第 %d 次请求，已拒绝" % st["giveups"])
 
     print("")
     print("  不解锁。先回答我两个问题：")
     print("")
     print("    1. 今天搞学习了吗？")
+    m = study_today_seconds() // 60
+    if m:
+        print("       （一建经验条记着：今天学了 %d 分钟%s）"
+              % (m, "，已达标" if study_met() else "，还差 %d 分钟" % (STUDY_GOAL_MIN - m)))
+    else:
+        print("       （一建经验条记着：今天 0 分钟）")
     print("    2. 做了有意义的事情了吗？")
     print("")
     print("  答完再来。但你要清楚：这个脚本不会给你解锁，")
@@ -1698,8 +1944,12 @@ def main():
         cmd_uninstall()
     elif cmd == "restart":
         cmd_restart()
+    elif cmd == "ensure":
+        return cmd_ensure()
     elif cmd == "giveup":
         cmd_giveup()
+    elif cmd == "debug":
+        cmd_debug()
     elif cmd == "config":
         cmd_config()
     elif cmd == "set":
