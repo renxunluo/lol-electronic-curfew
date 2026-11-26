@@ -80,6 +80,10 @@ PAGE = """<!DOCTYPE html>
                    border-radius: 50%; top: 3px; left: 3px; transition: .25s; }
   .switch.on::after { left: 23px; }
   .stepper { display: flex; align-items: center; gap: 10px; }
+  .seg { display: flex; background: #1e1e2a; border-radius: 10px; padding: 3px; }
+  .segbtn { border: 0; background: transparent; color: #9d9db5; font-size: 13px;
+            padding: 6px 14px; border-radius: 8px; cursor: pointer; font-family: inherit; }
+  .segbtn.on { background: #5b8cff; color: #fff; }
   .step { width: 26px; height: 26px; border-radius: 8px; border: none; background: #2c2c3d;
           color: #e8e8f0; font-size: 15px; line-height: 1; cursor: pointer; transition: .15s; }
   .step:hover { background: #3a3a55; }
@@ -111,14 +115,37 @@ PAGE = """<!DOCTYPE html>
 
   <div class="panel">
     <div class="row">
-      <span class="label">每日额度</span>
-      <div class="stepper">
-        <button class="step" id="limit-down" onclick="setLimit(-1)">−</button>
-        <span id="limitnum">5</span>
-        <button class="step" id="limit-up" onclick="setLimit(1)">+</button>
+      <span class="label">计算方式</span>
+      <div class="seg">
+        <button class="segbtn" id="seg-games" onclick="setMode('games')">按局数</button>
+        <button class="segbtn" id="seg-time" onclick="setMode('time')">按时间</button>
       </div>
     </div>
-    <div class="hint">前几把随便玩，打满就不让开了。最多 5 把，想更严可以往下调。</div>
+
+    <div id="row-games">
+      <div class="row" style="margin-top:14px">
+        <span class="label">每日额度</span>
+        <div class="stepper">
+          <button class="step" id="limit-down" onclick="setLimit(-1)">−</button>
+          <span id="limitnum">5</span>
+          <button class="step" id="limit-up" onclick="setLimit(1)">+</button>
+        </div>
+      </div>
+      <div class="hint">前几把随便玩，打满就不让开了。最多 5 把，想更严可以往下调。</div>
+    </div>
+
+    <div id="row-time" style="display:none">
+      <div class="row" style="margin-top:14px">
+        <span class="label">每天时长</span>
+        <div class="stepper">
+          <button class="step" id="time-down" onclick="setTimeLimit(-15)">−</button>
+          <span id="timenum">2</span>
+          <span style="color:#9d9db5;margin:0 4px">小时</span>
+          <button class="step" id="time-up" onclick="setTimeLimit(15)">+</button>
+        </div>
+      </div>
+      <div class="hint">打满这个时长就按下面的「赢一把就睡觉」收工。局内不打断，打完才判。</div>
+    </div>
 
     <div class="row" style="margin-top:18px">
       <span class="label">赢一把就睡觉</span>
@@ -189,8 +216,26 @@ async function load() {
 function render(d) {
   cfg = d.config || {};
   document.getElementById('date').textContent = d.date;
-  document.getElementById('count').firstChild.nodeValue = d.count;
-  document.getElementById('cap').textContent = '/ ' + d.limit + ' 把';
+  if ((cfg.mode || 'games') === 'time') {
+    const usedMin = Math.floor((d.time_used_sec || 0) / 60);
+    document.getElementById('count').firstChild.nodeValue = usedMin;
+    document.getElementById('cap').textContent = '/ ' + (cfg.time_limit_minutes || 120) + ' 分钟';
+  } else {
+    document.getElementById('count').firstChild.nodeValue = d.count;
+    document.getElementById('cap').textContent = '/ ' + d.limit + ' 把';
+  }
+
+  // 计算方式：按局数 / 按时间
+  const mode = cfg.mode || 'games';
+  document.getElementById('seg-games').className = 'segbtn' + (mode === 'games' ? ' on' : '');
+  document.getElementById('seg-time').className = 'segbtn' + (mode === 'time' ? ' on' : '');
+  document.getElementById('row-games').style.display = (mode === 'time') ? 'none' : '';
+  document.getElementById('row-time').style.display = (mode === 'time') ? '' : 'none';
+  const tmin = cfg.time_limit_minutes || 120;
+  document.getElementById('timenum').textContent = (tmin / 60).toFixed(tmin % 60 ? 1 : 0);
+  document.getElementById('time-down').style.opacity = tmin <= 15 ? 0.3 : 1;
+  document.getElementById('time-up').style.opacity = tmin >= 600 ? 0.3 : 1;
+  document.getElementById('row-time').dataset.min = tmin;
 
   const left = Math.max(0, d.limit - Math.max(0, d.count - (d.in_game ? 1 : 0)));
   document.getElementById('left').textContent =
@@ -283,6 +328,12 @@ async function postConfig(patch) {
   load();
 }
 function toggleKey(k) { postConfig({[k]: !cfg[k]}); }
+function setMode(m) { postConfig({mode: m}); }
+function setTimeLimit(delta) {
+  const cur = parseInt(cfg.time_limit_minutes || 120, 10);
+  const next = Math.min(600, Math.max(15, cur + delta));
+  postConfig({time_limit_minutes: next});
+}
 function addBlock() {
   const rs = (cfg.block_ranges || []).slice();
   if (rs.length >= 2) return;
@@ -340,6 +391,7 @@ def read_status():
         "date": L.datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "count": count,
         "limit": lim,
+        "time_used_sec": int(L.time_used_today(st)),
         "max_limit": cap,
         "in_game": bool(games),
         "client_on": bool(clients),
@@ -405,6 +457,14 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("win_to_sleep", "workday_block"):
                 if k in payload:
                     cfg[k] = bool(payload[k])
+            if "mode" in payload and str(payload["mode"]) in ("games", "time"):
+                cfg["mode"] = str(payload["mode"])
+            if "time_limit_minutes" in payload:
+                try:
+                    cfg["time_limit_minutes"] = max(
+                        15, min(600, int(payload["time_limit_minutes"])))
+                except (TypeError, ValueError):
+                    pass
             if "block_ranges" in payload and isinstance(payload["block_ranges"], list):
                 cleaned = []
                 for item in payload["block_ranges"][:2]:
