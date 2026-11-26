@@ -1492,7 +1492,13 @@ def tick(st):
             st["last_kill"] = now
             save_state(st)
             log("拦截成功，最近一局赢=%s" % st.get("last_win"))
-            if lim < LIMIT:
+            if MODE == "time":
+                used_min = int(time_used_today(st) // 60)
+                popup("今天已经打了 %d 分钟，到 %d 分钟上限了。\n\n"
+                      "英雄联盟已关闭，明天 4 点自动恢复。\n\n"
+                      "想多打一点，可以在界面上把「每天时长」调大。"
+                      % (used_min, TIME_LIMIT_MIN))
+            elif lim < LIMIT:
                 mins = study_today_seconds() // 60
                 popup("今天一建才学了 %d 分钟，没到 %d 分钟。\n\n"
                       "所以今天只给 %d 把，已经用完了。\n"
@@ -1564,7 +1570,7 @@ def cmd_status():
         print("  今日额度        %d 把（学满 %d 分钟可回到 %d 把）"
               % (lim, STUDY_GOAL_MIN, LIMIT))
     else:
-        print("  今日额度        %d 把（一建已学满 %d 分钟 ✅）" % (lim, STUDY_GOAL_MIN))
+        print("  今日额度        %d 把（不和学习挂钩）" % lim)
     print("  一建进度        今天 %d / %d 分钟%s"
           % (study_min, STUDY_GOAL_MIN,
              "  ✅ 已达标" if study_met() else "  还差 %d 分钟" % (STUDY_GOAL_MIN - study_min)))
