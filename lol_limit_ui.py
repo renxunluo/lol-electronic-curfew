@@ -144,7 +144,8 @@ PAGE = """<!DOCTYPE html>
           <button class="step" id="time-up" onclick="setTimeLimit(15)">+</button>
         </div>
       </div>
-      <div class="hint">打满这个时长就按下面的「赢一把就睡觉」收工。局内不打断，打完才判。</div>
+      <div class="hint">从游戏程序启动开始算，排队和选人不计时。
+        打满后按「赢一把就睡觉」收工——赢了才关，输了放你打到赢为止。局内不打断。</div>
     </div>
 
     <div class="row" style="margin-top:18px">
